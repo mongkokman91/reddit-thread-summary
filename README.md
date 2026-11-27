@@ -122,7 +122,9 @@ A recap is saved per post for six hours. Opening that thread shows the saved rec
 
 `https://raw.githubusercontent.com/mongkokman91/reddit-thread-summary/main/reddit-thread-summary.user.js`
 
-Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.0`.
+Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.1`.
+
+A crosspost is summarized from the original thread, labeled with that subreddit. If that discussion is empty too, the card says "No comments to summarize yet" instead of waiting on Gemini. A summary that runs longer than about a minute stops with **Try again**. If Gemini answers 503, 500, or that the model is overloaded, the script retries once and then uses `gemini-3.5-flash-lite`, and the card says which model wrote it.
 
 ## Privacy
 

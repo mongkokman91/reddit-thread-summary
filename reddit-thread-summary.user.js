@@ -74,6 +74,9 @@
   var KEY_FEED_INDEX = 'rts.feedIndex';
   var KEY_NO_INFINITE = 'rts.noInfinite';
   var FEED_MIN_COMMENTS = 5;
+  var MIN_DISCUSSION_COMMENTS = 2;
+  var SUMMARY_TIMEOUT_MS = 60000;
+  var OVERLOAD_RETRY_MS = 2000;
   var FEED_JSON_CONCURRENCY = 2;
   var FEED_GEMINI_GAP_MS = 6000;
   var FEED_DWELL_MS = 1000;
@@ -649,10 +652,17 @@
     flatten(picked, 0, lines);
 
     var selftext = post.selftext || '';
-    var crosspost = Array.isArray(post.crosspost_parent_list) ? post.crosspost_parent_list[0] : null;
-    if (crosspost) {
-      selftext += '\n\nCrosspost from r/' + (crosspost.subreddit || '') + ': ' +
-        (crosspost.title || '') + '\n' + (crosspost.selftext || '');
+    var crosspostData = Array.isArray(post.crosspost_parent_list) ? post.crosspost_parent_list[0] : null;
+    var parentFullname = post.crosspost_parent || (crosspostData && crosspostData.name) || '';
+    var parentId = String((crosspostData && crosspostData.id) || parentFullname || '').replace(/^t3_/i, '').toLowerCase();
+    var crosspost = parentId ? {
+      id: parentId,
+      subreddit: (crosspostData && crosspostData.subreddit) || '',
+      permalink: (crosspostData && crosspostData.permalink) || ''
+    } : null;
+    if (crosspostData) {
+      selftext += '\n\nCrosspost from r/' + (crosspostData.subreddit || '') + ': ' +
+        (crosspostData.title || '') + '\n' + (crosspostData.selftext || '');
     }
     var poll = '';
     if (post.poll_data && Array.isArray(post.poll_data.options)) {
@@ -678,8 +688,41 @@
       poll: poll,
       selftext: cleanBlock(selftext, LIMITS.selftextChars),
       commentsText: lines.join('\n'),
-      authors: state.authors
+      authors: state.authors,
+      crosspost: crosspost,
+      sourceNote: ''
     };
+  }
+
+  function discussionIsThin(thread) {
+    return !thread || (thread.commentCount || 0) < MIN_DISCUSSION_COMMENTS;
+  }
+
+  function emptyDiscussionText(thread) {
+    if (thread && thread.sourceNote) {
+      return 'No comments to summarize yet. ' +
+        thread.sourceNote.charAt(0).toUpperCase() + thread.sourceNote.slice(1) + '.';
+    }
+    return 'No comments to summarize yet.';
+  }
+
+  function crosspostJsonUrls(crosspost) {
+    if (!crosspost) return [];
+    if (crosspost.permalink) {
+      var absolute = crosspost.permalink;
+      if (absolute.indexOf('http') !== 0) {
+        absolute = 'https://www.reddit.com' + (absolute.charAt(0) === '/' ? absolute : '/' + absolute);
+      }
+      var fromPermalink = threadJsonUrls(absolute);
+      if (fromPermalink.length) return fromPermalink;
+    }
+    if (!crosspost.id) return [];
+    var query = '.json?raw_json=1&limit=100&depth=6&sort=top';
+    var id = encodeURIComponent(crosspost.id);
+    return [
+      'https://www.reddit.com/comments/' + id + query,
+      'https://old.reddit.com/comments/' + id + query
+    ];
   }
 
   function buildPrompt(thread) {
@@ -693,6 +736,7 @@
       'score: ' + thread.score,
       'postType: ' + thread.postType
     ];
+    if (thread.sourceNote) lines.push('note: ' + thread.sourceNote);
     if (thread.linkUrl) lines.push('link: ' + thread.linkUrl);
     if (thread.flair) lines.push('flair: ' + thread.flair);
     if (thread.poll) lines.push('poll: ' + thread.poll);
@@ -742,6 +786,12 @@
     return value.slice(0, max - 1) + '…';
   }
 
+  function isOverloaded(status, statusName, message) {
+    if (status === 500 || status === 503) return true;
+    if (String(statusName || '').toUpperCase() === 'UNAVAILABLE') return true;
+    return /overloaded|high demand/i.test(message || '');
+  }
+
   function isExhausted(status, statusName, message) {
     return status === 429 || statusName === 'RESOURCE_EXHAUSTED' ||
       /RESOURCE_EXHAUSTED|resource exhausted|quota exceeded|rate limit/i.test(message);
@@ -774,6 +824,13 @@
     var message = String(error.message || bodyText || '');
     var statusName = String(error.status || '');
     var used = model || '';
+    if (isOverloaded(status, statusName, message)) {
+      return {
+        type: 'overloaded',
+        overloaded: true,
+        message: (used || 'Gemini') + ' is busy right now (' + clip(message, 140) + ').'
+      };
+    }
     var exhausted = isExhausted(status, statusName, message);
     var paidBlock = isFreeTierBlock(message);
     // 3.8 Flash is the default and only has about 20 free requests a day.
@@ -1152,8 +1209,7 @@
     }
   }
 
-  async function fetchThread(href, feed) {
-    var urls = threadJsonUrls(href);
+  async function fetchJsonListing(urls, feed) {
     var lastError = null;
     for (var i = 0; i < urls.length; i++) {
       try {
@@ -1172,6 +1228,32 @@
       }
     }
     throw lastError || redditHttpError(0);
+  }
+
+  async function fetchThread(href, feed) {
+    return fetchJsonListing(threadJsonUrls(href), feed);
+  }
+
+  // A crosspost with no discussion of its own still points at the original
+  // thread. Summarize that thread, and say which subreddit it came from.
+  async function useOriginalThread(thread, feed) {
+    if (!thread || !thread.crosspost) return thread;
+    var urls = crosspostJsonUrls(thread.crosspost);
+    if (!urls.length) return thread;
+    try {
+      var parent = await fetchJsonListing(urls, feed);
+      var sub = parent.subreddit || thread.crosspost.subreddit || '';
+      thread.commentsText = parent.commentsText;
+      thread.commentCount = parent.commentCount;
+      if (parent.authors && parent.authors.length) thread.authors = parent.authors;
+      if (!thread.selftext && parent.selftext) thread.selftext = parent.selftext;
+      thread.sourceNote = sub ? 'from the original thread in r/' + sub : 'from the original thread';
+    } catch (err) {
+      if (thread.crosspost.subreddit) {
+        thread.sourceNote = 'from the original thread in r/' + thread.crosspost.subreddit;
+      }
+    }
+    return thread;
   }
 
   async function generateWithModel(thread, key, model, systemText, feed) {
@@ -1223,6 +1305,7 @@
       var failed = new Error(classified.message);
       failed.type = classified.type;
       failed.autoRetry = !!classified.autoRetry;
+      failed.overloaded = !!classified.overloaded;
       throw failed;
     }
     var gaveUp = new Error('Gemini did not return a summary.');
@@ -1242,27 +1325,51 @@
     try { sessionStorage.removeItem(SESSION_38); } catch (err) { /* ignore */ }
   }
 
-  // Returns { text, model, fallbackFrom }. model is the one that wrote the
-  // summary. fallbackFrom is set when 3.8 Flash was skipped or rate-limited
-  // and Flash-Lite answered instead. The saved model setting is not changed.
-  async function callGemini(thread, key, requested, onStatus, allowSessionFallback) {
+  function delay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  // One attempt, and if Gemini is overloaded (500/503/UNAVAILABLE), one retry
+  // of the same model after a short wait. Quota errors are not retried here.
+  async function generateOnceOrRetryOverload(thread, key, model, systemText, feed, onStatus) {
+    try {
+      return await generateWithModel(thread, key, model, systemText, feed);
+    } catch (err) {
+      if (!(err && err.overloaded)) throw err;
+      if (onStatus) onStatus(model + ' is busy. Retrying…');
+      await delay(OVERLOAD_RETRY_MS);
+      return await generateWithModel(thread, key, model, systemText, feed);
+    }
+  }
+
+  // Returns { text, model, fallbackFrom, fallbackReason }. fallbackFrom is set
+  // when a different model wrote the summary. The saved model is not changed.
+  async function callGemini(thread, key, requested, onStatus, allowSessionFallback, systemText, feed) {
     var model = requested;
     var skipped = '';
+    var reason = '';
     if (allowSessionFallback && requested === DEFAULT_MODEL && flash38Exhausted()) {
       model = FALLBACK_MODEL;
       skipped = requested;
+      reason = 'quota';
       if (onStatus) onStatus('gemini-3.8-flash already hit its free-tier limit. Using gemini-3.5-flash-lite…');
     }
     try {
-      var text = await generateWithModel(thread, key, model);
+      var text = await generateOnceOrRetryOverload(thread, key, model, systemText, feed, onStatus);
       if (model === DEFAULT_MODEL) clearFlash38Exhausted();
-      return { text: text, model: model, fallbackFrom: skipped };
+      return { text: text, model: model, fallbackFrom: skipped, fallbackReason: reason };
     } catch (err) {
-      if (!(err && err.autoRetry) || model === FALLBACK_MODEL) throw err;
-      markFlash38Exhausted();
-      if (onStatus) onStatus('gemini-3.8-flash is out of free requests. Trying gemini-3.5-flash-lite…');
-      var retry = await generateWithModel(thread, key, FALLBACK_MODEL);
-      return { text: retry, model: FALLBACK_MODEL, fallbackFrom: requested };
+      var switchModel = err && (err.autoRetry || err.overloaded) && model !== FALLBACK_MODEL;
+      if (!switchModel) throw err;
+      var why = err.overloaded ? 'overload' : 'quota';
+      if (why === 'quota') markFlash38Exhausted();
+      if (onStatus) {
+        onStatus(why === 'overload'
+          ? model + ' is overloaded. Trying gemini-3.5-flash-lite…'
+          : 'gemini-3.8-flash is out of free requests. Trying gemini-3.5-flash-lite…');
+      }
+      var retry = await generateOnceOrRetryOverload(thread, key, FALLBACK_MODEL, systemText, feed, onStatus);
+      return { text: retry, model: FALLBACK_MODEL, fallbackFrom: model, fallbackReason: why };
     }
   }
 
@@ -1548,8 +1655,13 @@
 
   function summaryNote(rec, fromCache) {
     var parts = ['Not a mod comment'];
+    if (rec && rec.sourceNote) parts.push(rec.sourceNote);
     if (rec && rec.model) parts.push(rec.model);
-    if (rec && rec.fallbackFrom) parts.push(rec.fallbackFrom + ' hit its daily limit');
+    if (rec && rec.fallbackFrom) {
+      parts.push(rec.fallbackReason === 'overload'
+        ? rec.fallbackFrom + ' was busy'
+        : rec.fallbackFrom + ' hit its daily limit');
+    }
     if (fromCache && rec && rec.cachedAt) parts.push(ageLabel(rec.cachedAt));
     return parts.join(' · ');
   }
@@ -1691,15 +1803,42 @@
     }
 
     renderLoading(panel, 'Reading the thread…', undefined, hadPreview);
+    var timedOut = false;
+    var summaryTimer = setTimeout(function () {
+      timedOut = true;
+      abortLive();
+      if (my !== runToken) return;
+      renderProblem(panel, {
+        type: 'timeout',
+        message: 'The summary took too long. Try again.'
+      });
+    }, SUMMARY_TIMEOUT_MS);
     try {
       var thread = await fetchThread(location.href);
-      if (my !== runToken) return;
+      if (timedOut || my !== runToken) return;
+      thread = await useOriginalThread(thread, false);
+      if (timedOut || my !== runToken) return;
+      if (discussionIsThin(thread)) {
+        var emptyRec = {
+          markdown: emptyDiscussionText(thread),
+          commentCount: thread.commentCount || 0,
+          cachedAt: Date.now(),
+          model: '',
+          fallbackFrom: '',
+          sourceNote: thread.sourceNote || ''
+        };
+        writeCache(postId, model, emptyRec);
+        renderReady(panel, emptyRec, false);
+        return;
+      }
       renderLoading(panel, 'Writing the TL;DR…', thread.commentCount, hadPreview);
+      if (thread.sourceNote) setNote(panel, 'Not a mod comment · ' + thread.sourceNote);
       var generated = await callGemini(thread, key, model, function (message) {
-        if (my !== runToken) return;
+        if (timedOut || my !== runToken) return;
         renderLoading(panel, message, thread.commentCount, true);
+        if (thread.sourceNote) setNote(panel, 'Not a mod comment · ' + thread.sourceNote);
       }, !opts.force);
-      if (my !== runToken) return;
+      if (timedOut || my !== runToken) return;
       var raw = generated.text;
       var markdown = prepareSummary(raw, thread);
       if (!markdown) {
@@ -1712,7 +1851,9 @@
         commentCount: thread.commentCount,
         cachedAt: Date.now(),
         model: generated.model,
-        fallbackFrom: generated.fallbackFrom || ''
+        fallbackFrom: generated.fallbackFrom || '',
+        fallbackReason: generated.fallbackReason || '',
+        sourceNote: thread.sourceNote || ''
       };
       writeCache(postId, model, rec);
       var compact = compactForFeed(markdown);
@@ -1721,14 +1862,17 @@
           markdown: compact,
           commentCount: thread.commentCount,
           cachedAt: rec.cachedAt,
-          model: generated.model
+          model: generated.model,
+          sourceNote: thread.sourceNote || ''
         });
       }
-      if (my !== runToken) return;
+      if (timedOut || my !== runToken) return;
       renderReady(panel, rec, false);
     } catch (err) {
-      if (my !== runToken || (err && err.type === 'abort')) return;
+      if (timedOut || my !== runToken || (err && err.type === 'abort')) return;
       renderProblem(panel, err);
+    } finally {
+      clearTimeout(summaryTimer);
     }
   }
 
@@ -2025,7 +2169,7 @@
     body.innerHTML = renderMarkdown(rec.markdown || '');
   }
 
-  function showFeedError(box, message) {
+  function showFeedError(box, message, onRetry) {
     if (!box || !box.querySelector) return;
     var body = box.querySelector('.rts-feed-body');
     if (!body) return;
@@ -2034,6 +2178,27 @@
     status.className = 'rts-feed-error';
     status.textContent = message;
     body.appendChild(status);
+    if (!onRetry) return;
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'rts-load-more';
+    button.textContent = 'Try again';
+    button.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      onRetry();
+    });
+    body.appendChild(button);
+  }
+
+  function ensureItemBox(item) {
+    if (item.box && item.box.isConnected) return item.box;
+    if (!item.card || !item.card.isConnected || typeof document === 'undefined') return item.box || null;
+    var box = document.getElementById('rts-feed-' + item.postId) || buildFeedBox(item.postId);
+    placeFeedBox(item.card, box);
+    applyTheme(box);
+    item.box = box;
+    return box;
   }
 
   function cancelDwell(card) {
@@ -2116,38 +2281,72 @@
         delete feedQueued[item.postId];
         return;
       }
+      var settled = false;
+      var feedTimer = setTimeout(function () {
+        if (settled) return;
+        var lateBox = ensureItemBox(item);
+        showFeedError(lateBox, 'The summary took too long. Try again.', function () {
+          delete feedQueued[item.postId];
+          item.attempts = 0;
+          item.quiet = false;
+          feedQueued[item.postId] = true;
+          feedQueue.push(item);
+          pumpFeed();
+        });
+      }, SUMMARY_TIMEOUT_MS);
+      try {
       var thread = await fetchThread(item.href, true);
       if (!feedEnabled()) return;
+      thread = await useOriginalThread(thread, true);
+      if (!feedEnabled()) return;
       if (thread.commentCount < FEED_MIN_COMMENTS) {
-        writeFeedCache(item.postId, { skip: true, commentCount: thread.commentCount, cachedAt: Date.now() });
-        if (item.box && item.box.parentElement) item.box.remove();
+        if (thread.crosspost || thread.sourceNote) {
+          var note = discussionIsThin(thread)
+            ? emptyDiscussionText(thread)
+            : 'Not enough discussion to recap yet.';
+          var noteBox = ensureItemBox(item);
+          if (noteBox) fillFeedBox(noteBox, { markdown: note });
+          writeFeedCache(item.postId, {
+            markdown: note,
+            commentCount: thread.commentCount,
+            cachedAt: Date.now(),
+            model: '',
+            sourceNote: thread.sourceNote || ''
+          });
+        } else {
+          writeFeedCache(item.postId, { skip: true, commentCount: thread.commentCount, cachedAt: Date.now() });
+          if (item.box && item.box.parentElement) item.box.remove();
+        }
         delete feedQueued[item.postId];
         return;
       }
+      var busyBox = ensureItemBox(item);
+      if (busyBox && !item.quiet) showFeedLoading(busyBox);
+      else if (busyBox && !(busyBox.querySelector('.rts-feed-body') || {}).textContent) showFeedLoading(busyBox);
       await waitGeminiSlot();
       if (!feedEnabled()) return;
-      var requested = getFeedModel();
-      var produced = requested;
-      var text;
-      try {
-        text = await generateWithModel(thread, key, requested, FEED_PROMPT, true);
-      } catch (err) {
-        if (!(err && err.autoRetry) || requested === FALLBACK_MODEL) throw err;
-        produced = FALLBACK_MODEL;
-        text = await generateWithModel(thread, key, FALLBACK_MODEL, FEED_PROMPT, true);
-      }
+      var generated = await callGemini(thread, key, getFeedModel(), function () {}, false, FEED_PROMPT, true);
       geminiBackoffMs = 0;
-      var markdown = prepareFeedSummary(text, thread.authors);
+      var markdown = prepareFeedSummary(generated.text, thread.authors);
       if (!markdown) throw new Error('Gemini returned an empty recap.');
+      if (thread.sourceNote) markdown = thread.sourceNote.charAt(0).toUpperCase() + thread.sourceNote.slice(1) + '.\n\n' + markdown;
       var rec = {
         markdown: markdown,
         commentCount: thread.commentCount,
         cachedAt: Date.now(),
-        model: produced
+        model: generated.model,
+        sourceNote: thread.sourceNote || '',
+        fallbackFrom: generated.fallbackFrom || '',
+        fallbackReason: generated.fallbackReason || ''
       };
       writeFeedCache(item.postId, rec);
-      if (item.box && item.box.isConnected) fillFeedBox(item.box, rec);
+      var doneBox = ensureItemBox(item);
+      if (doneBox) fillFeedBox(doneBox, rec);
       delete feedQueued[item.postId];
+      } finally {
+        settled = true;
+        clearTimeout(feedTimer);
+      }
     } catch (err) {
       if (err && err.type === 'abort') {
         delete feedQueued[item.postId];
@@ -2188,12 +2387,28 @@
     try { href = location.href; } catch (err) { href = ''; }
     if (threadIdFromUrl(href) === id) return;
     var known = commentCountFromCard(card);
-    if (known != null && known < FEED_MIN_COMMENTS) return;
+    var quiet = known != null && known < FEED_MIN_COMMENTS;
     var cached = readFeedCache(id);
     if (cached && cached.skip) return;
     if (!cached || !cached.markdown) {
       var fromThread = readThreadSummaryForFeed(id);
       if (fromThread) cached = fromThread;
+    }
+    // A crosspost often shows 0 comments of its own. Fetch before deciding
+    // to hide it, but don't put up a loading box until we know there's a discussion.
+    if (quiet && !(cached && cached.markdown)) {
+      if (feedQueued[id]) return;
+      feedQueued[id] = true;
+      feedQueue.push({
+        postId: id,
+        href: cardPermalink(card),
+        box: null,
+        card: card,
+        attempts: 0,
+        quiet: true
+      });
+      pumpFeed();
+      return;
     }
     var box = document.getElementById('rts-feed-' + id) || buildFeedBox(id);
     placeFeedBox(card, box);
@@ -2581,6 +2796,11 @@
       FEED_MIN_COMMENTS: FEED_MIN_COMMENTS,
       FEED_GEMINI_GAP_MS: FEED_GEMINI_GAP_MS,
       FEED_DWELL_MS: FEED_DWELL_MS,
+      SUMMARY_TIMEOUT_MS: SUMMARY_TIMEOUT_MS,
+      OVERLOAD_RETRY_MS: OVERLOAD_RETRY_MS,
+      discussionIsThin: discussionIsThin,
+      emptyDiscussionText: emptyDiscussionText,
+      crosspostJsonUrls: crosspostJsonUrls,
       isFeedSentinel: isFeedSentinel,
       isOldReddit: isOldReddit,
       infiniteScrollDisabled: infiniteScrollDisabled,
