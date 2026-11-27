@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.4
+// @version      1.1.5
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -73,6 +73,7 @@
   var KEY_FEED_MODEL = 'rts.feedModel';
   var KEY_FEED_INDEX = 'rts.feedIndex';
   var KEY_DIGEST_ON = 'rts.digestOn';
+  var KEY_MULTI_DIGEST_ON = 'rts.multiDigestOn';
   var KEY_DIGEST_COLLAPSED = 'rts.digestCollapsed';
   var KEY_DIGEST_INDEX = 'rts.digestIndex';
   var KEY_NO_INFINITE = 'rts.noInfinite';
@@ -1239,6 +1240,7 @@
   }
 
   function redditTarget(kind, meta) {
+    if (kind === 'digest' && meta && meta.feedName) return "your " + meta.feedName + " feed's post list";
     if (kind === 'digest') return "r/" + ((meta && meta.sub) || 'this subreddit') + "'s post list";
     if (kind === 'feed') return 'this post';
     return 'this thread';
@@ -2180,6 +2182,7 @@
     });
     addMenu((feedEnabled() ? '✓ ' : '') + 'Feed recaps', toggleFeedRecaps);
     addMenu((digestEnabled() ? '✓ ' : '') + 'Subreddit digest', toggleDigest);
+    addMenu((multiDigestEnabled() ? '✓ ' : '') + 'Digest on custom feeds', toggleMultiDigest);
     addMenu((infiniteScrollDisabled() ? '✓ ' : '') + 'Disable infinite scroll', toggleInfiniteScroll);
     addMenu('Set feed model (' + getFeedModel() + ')', function () {
       if (!askForFeedModel()) return;
@@ -2917,6 +2920,7 @@
     '1. One paragraph of 2 or 3 sentences: what this subreddit is talking about in this listing. Bold the key topics.',
     '2. Then 3 to 5 bullets. Each starts with **Theme name:** and names the relevant posts as markdown links using the exact URLs given below. Group posts that belong together. Do not invent posts or links.',
     '3. Then a heading line exactly **Actionable takeaways** and 1 to 4 bullets. Always include this section. On a light or joke listing, a takeaway can be the vibe or the post most worth opening. Do not pad.',
+    'If this is a custom feed or a combined list of communities, group themes across subreddits and tag each theme and each post with its subreddit, like r/ChatGPT.',
     'Never invent titles, scores, comment counts, or usernames. Casual and readable. Humor is fine. Never insult anyone.'
   ].join('\n');
   var digestToken = 0;
@@ -2926,31 +2930,79 @@
     return value !== false && value !== 'false';
   }
 
+  function multiDigestEnabled() {
+    var value = gmGet(KEY_MULTI_DIGEST_ON, true);
+    return value !== false && value !== 'false';
+  }
+
+  function sortFromUrl(url, pathSort) {
+    var sort = (pathSort || url.searchParams.get('sort') || 'best').toLowerCase();
+    if (!DIGEST_SORTS[sort]) sort = 'best';
+    var windowName = '';
+    if (sort === 'top' || sort === 'controversial') {
+      windowName = (url.searchParams.get('t') || 'day').toLowerCase();
+      if (!DIGEST_WINDOWS[windowName]) windowName = 'day';
+    }
+    return { sort: sort, t: windowName };
+  }
+
+  function feedDisplayName(slug) {
+    if (!slug) return 'custom';
+    if (slug !== slug.toLowerCase()) return slug;
+    if (slug.length <= 3) return slug.toUpperCase();
+    return slug.charAt(0).toUpperCase() + slug.slice(1);
+  }
+
   function subredditFeed(href) {
     try {
       var url = new URL(href);
       if (!HOSTS[url.hostname]) return null;
       if (/\/comments\//i.test(url.pathname)) return null;
+      var multi = url.pathname.match(/^\/(?:user\/([^/]+)\/m|me\/m)\/([^/]+)(?:\/(hot|new|top|rising|controversial|best))?\/?$/i);
+      if (multi) {
+        var timing = sortFromUrl(url, multi[3]);
+        var user = multi[1] || '';
+        return {
+          kind: user ? 'user-multi' : 'me-multi',
+          user: user,
+          name: multi[2],
+          feedName: feedDisplayName(multi[2]),
+          sub: multi[2],
+          sort: timing.sort,
+          t: timing.t
+        };
+      }
       var match = url.pathname.match(/^\/r\/([^/]+)(?:\/(hot|new|top|rising|controversial|best))?\/?$/i);
       if (!match) return null;
       var sub = match[1];
-      if (sub.indexOf('+') !== -1) return null;
       if (AGGREGATE_SUBS[sub.toLowerCase()]) return null;
-      var sort = (match[2] || url.searchParams.get('sort') || 'best').toLowerCase();
-      if (!DIGEST_SORTS[sort]) sort = 'best';
-      var windowName = '';
-      if (sort === 'top' || sort === 'controversial') {
-        windowName = (url.searchParams.get('t') || 'day').toLowerCase();
-        if (!DIGEST_WINDOWS[windowName]) windowName = 'day';
+      var single = sortFromUrl(url, match[2]);
+      if (sub.indexOf('+') !== -1) {
+        var parts = sub.split('+').filter(Boolean);
+        if (parts.length < 2) return null;
+        return {
+          kind: 'combined',
+          parts: parts,
+          feedName: parts.join(' + '),
+          sub: sub,
+          sort: single.sort,
+          t: single.t
+        };
       }
-      return { sub: sub, sort: sort, t: windowName };
+      return { kind: 'subreddit', sub: sub, sort: single.sort, t: single.t };
     } catch (err) {
       return null;
     }
   }
 
   function digestCacheKey(info) {
-    return 'rts.digest.' + info.sub.toLowerCase() + '.' + info.sort + '.' + (info.t || '-');
+    var id = info.sub.toLowerCase();
+    if (info.kind === 'user-multi') id = 'multi.' + info.user.toLowerCase() + '.' + info.name.toLowerCase();
+    else if (info.kind === 'me-multi') id = 'multi.me.' + info.name.toLowerCase();
+    else if (info.kind === 'combined') {
+      id = 'multi.r.' + info.parts.map(function (part) { return part.toLowerCase(); }).join('+');
+    }
+    return 'rts.digest.' + id + '.' + info.sort + '.' + (info.t || '-');
   }
 
   function readDigestCache(key) {
@@ -2996,7 +3048,8 @@
         score: data.score || 0,
         comments: data.num_comments || 0,
         flair: data.link_flair_text ? oneLine(data.link_flair_text, 40) : '',
-        permalink: data.permalink || ''
+        permalink: data.permalink || '',
+        subreddit: data.subreddit || ''
       });
     });
     return posts.slice(0, DIGEST_POSTS);
@@ -3006,13 +3059,16 @@
     var sortName = info.usedSort || info.sort;
     var windowName = sortName === info.sort ? info.t : '';
     var lines = [
-      'Subreddit: r/' + info.sub,
+      info.feedName ? 'Custom feed: ' + info.feedName : 'Subreddit: r/' + info.sub,
       'Sort: ' + sortName + (windowName ? ' (' + windowName + ')' : ''),
       ''
     ];
     posts.forEach(function (post, index) {
-      var url = post.permalink ? 'https://www.reddit.com' + post.permalink : '';
-      lines.push((index + 1) + '. ' + post.title);
+      var url = post.permalink
+        ? (post.permalink.indexOf('http') === 0 ? post.permalink : 'https://www.reddit.com' + post.permalink)
+        : '';
+      var where = post.subreddit ? 'r/' + post.subreddit + ': ' : '';
+      lines.push((index + 1) + '. ' + where + post.title);
       if (url) lines.push('url: ' + url);
       lines.push('score ' + post.score + ', ' + post.comments + ' comments' + (post.flair ? ', flair ' + post.flair : ''));
       if (post.selftext) lines.push('body: ' + post.selftext);
@@ -3022,6 +3078,16 @@
     var text = lines.join('\n');
     if (text.length > 14000) text = text.slice(0, 13999) + '…';
     return text;
+  }
+
+  function subredditFromCard(el) {
+    if (!el || !el.getAttribute) return '';
+    var name = el.getAttribute('subreddit-prefixed-name') || el.getAttribute('subreddit-name') || el.getAttribute('data-subreddit') || '';
+    name = String(name).replace(/^\/?r\//i, '').trim();
+    if (name) return name;
+    var node = el.querySelector && el.querySelector('a.subreddit');
+    if (!node) return '';
+    return String(node.textContent || '').replace(/^\/?r\//i, '').trim();
   }
 
   function flairFromCard(el) {
@@ -3080,6 +3146,7 @@
         score: scoreFromCard(el),
         comments: commentCountFromCard(el) || 0,
         flair: flairFromCard(el),
+        subreddit: subredditFromCard(el),
         permalink: permalinkPath(permalink)
       });
     }
@@ -3087,13 +3154,21 @@
   }
 
   function listingPath(info) {
-    var path = '/r/' + encodeURIComponent(info.sub) + '/' + info.sort + '.json?raw_json=1&limit=' + DIGEST_POSTS;
-    if (info.t) path += '&t=' + encodeURIComponent(info.t);
-    return path;
+    var sort = info.sort || 'best';
+    var query = '.json?raw_json=1&limit=' + DIGEST_POSTS;
+    if (info.t) query += '&t=' + encodeURIComponent(info.t);
+    if (info.kind === 'user-multi') {
+      return '/user/' + encodeURIComponent(info.user) + '/m/' + encodeURIComponent(info.name) + '/' + sort + query;
+    }
+    if (info.kind === 'me-multi') {
+      return '/me/m/' + encodeURIComponent(info.name) + '/' + sort + query;
+    }
+    if (info.kind === 'combined') return '/r/' + info.parts.join('+') + '/' + sort + query;
+    return '/r/' + encodeURIComponent(info.sub) + '/' + sort + query;
   }
 
   async function loadDigestListing(info) {
-    var payload = await fetchRedditJson(listingPath(info), 'digest', { sub: info.sub });
+    var payload = await fetchRedditJson(listingPath(info), 'digest', { sub: info.sub, feedName: info.feedName });
     return parseSubredditListing(payload);
   }
 
@@ -3108,7 +3183,16 @@
       loadError = err;
       if (info.sort === 'best') {
         try {
-          posts = await loadDigestListing({ sub: info.sub, sort: 'hot', t: '' });
+          posts = await loadDigestListing({
+            kind: info.kind,
+            user: info.user,
+            name: info.name,
+            parts: info.parts,
+            feedName: info.feedName,
+            sub: info.sub,
+            sort: 'hot',
+            t: ''
+          });
           usedSort = 'hot';
           loadError = null;
         } catch (hotErr) {
@@ -3126,8 +3210,8 @@
       }
     }
     if (!posts || !posts.length) {
-      var failed = new Error("Couldn't load r/" + info.sub + "'s post list" +
-        (loadError && loadError.status ? ' (HTTP ' + loadError.status + ')' : '') + '.');
+        var failed = new Error("Couldn't load " + (info.feedName ? 'your ' + info.feedName + ' feed' : 'r/' + info.sub) + "'s post list" +
+          (loadError && loadError.status ? ' (HTTP ' + loadError.status + ')' : '') + '.');
       failed.status = loadError && loadError.status;
       failed.type = 'reddit';
       throw failed;
@@ -3270,11 +3354,12 @@
     button.setAttribute('aria-label', collapsed ? 'Expand digest' : 'Collapse digest');
   }
 
-  function digestHeading(sub, sort, windowName) {
-    var name = sort || 'best';
+  function digestHeading(info) {
+    var name = (info && info.sort) || 'best';
     var label = name.charAt(0).toUpperCase() + name.slice(1);
-    if (windowName) label += ' · ' + windowName;
-    return 'What r/' + sub + ' is talking about (' + label + ')';
+    if (info && info.t) label += ' · ' + info.t;
+    if (info && info.feedName) return 'What your ' + info.feedName + ' feed is talking about (' + label + ')';
+    return 'What r/' + (info && info.sub) + ' is talking about (' + label + ')';
   }
 
   function digestSortLabel(info) {
@@ -3306,7 +3391,7 @@
     if (error) error.classList.add('rts-hidden');
     if (summary) summary.innerHTML = renderMarkdown(rec.markdown || '');
     var title = box.querySelector('.rts-title');
-    if (title && rec.sub) title.textContent = digestHeading(rec.sub, rec.sort, rec.t);
+    if (title && (rec.sub || rec.feedName)) title.textContent = digestHeading(rec);
     if (note) {
       var bits = [];
       if (rec.model) bits.push(rec.model);
@@ -3333,7 +3418,7 @@
     var keyName = digestCacheKey(info);
     box.dataset.key = keyName;
     var title = box.querySelector('.rts-title');
-    if (title) title.textContent = digestHeading(info.sub, info.sort, info.t);
+    if (title) title.textContent = digestHeading(info);
     if (!force) {
       var cached = readDigestCache(keyName);
       if (cached && my === digestToken) {
@@ -3392,7 +3477,8 @@
         fallbackReason: generated.fallbackReason || '',
         sort: info.usedSort || info.sort,
         t: info.usedSort && info.usedSort !== info.sort ? '' : (info.t || ''),
-        sub: info.sub
+        sub: info.sub,
+        feedName: info.feedName || ''
       };
       writeDigestCache(keyName, rec);
       if (!alive || my !== digestToken) return;
@@ -3408,9 +3494,10 @@
 
   function syncDigest(force) {
     if (typeof document === 'undefined') return;
-    var info = digestEnabled() ? subredditFeed(location.href) : null;
+    var info = subredditFeed(location.href);
     var existing = document.getElementById('rts-digest');
-    if (!info) {
+    var allowed = info && (info.feedName ? multiDigestEnabled() : digestEnabled());
+    if (!allowed) {
       if (existing) existing.remove();
       return;
     }
@@ -3426,6 +3513,12 @@
 
   function toggleDigest() {
     gmSet(KEY_DIGEST_ON, !digestEnabled());
+    registerMenus();
+    syncDigest(false);
+  }
+
+  function toggleMultiDigest() {
+    gmSet(KEY_MULTI_DIGEST_ON, !multiDigestEnabled());
     registerMenus();
     syncDigest(false);
   }
@@ -3581,6 +3674,9 @@
       redditHttpError: redditHttpError,
       scrapeDigestPosts: scrapeDigestPosts,
       subredditFeed: subredditFeed,
+      listingPath: listingPath,
+      digestCacheKey: digestCacheKey,
+      digestHeading: digestHeading,
       parseSubredditListing: parseSubredditListing,
       getFeedModel: getFeedModel,
       feedEnabled: feedEnabled
