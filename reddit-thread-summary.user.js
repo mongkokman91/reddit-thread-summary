@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.7
+// @version      1.1.8
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -2311,7 +2311,7 @@
     var order = [];
     for (var i = 0; i < candidates.length; i++) {
       var link = candidates[i];
-      if (link.closest('.rts-feed, .rts-digest, aside, nav, shreddit-ad, [data-testid="search-comment"]')) continue;
+      if (link.closest('.rts-feed, #rts-digest, aside, nav, shreddit-ad, [data-testid="search-comment"]')) continue;
       var info = searchPostLink(link, href);
       var title = oneLine(link.textContent || '', 160);
       if (!info || !title || parseCommentCount(title) != null) continue;
@@ -2328,7 +2328,7 @@
       function onlyThisPost(node) {
         var links = node.querySelectorAll(SEARCH_LINK);
         for (var j = 0; j < links.length; j++) {
-          if (links[j].closest('.rts-feed, .rts-digest')) continue;
+          if (links[j].closest('.rts-feed, #rts-digest')) continue;
           var other = searchPostLink(links[j], href);
           if (other && other.id !== id) return false;
         }
@@ -3007,6 +3007,7 @@
     'Never invent titles, scores, comment counts, or usernames. Casual and readable. Humor is fine. Never insult anyone.'
   ].join('\n');
   var digestToken = 0;
+  var searchDigestBox = null;
 
   function digestEnabled() {
     var value = gmGet(KEY_DIGEST_ON, true);
@@ -3352,7 +3353,13 @@
   function findDigestAnchor(doc, info) {
     if (info && info.kind === 'search') {
       var first = searchResultCards(doc, location.href)[0];
-      return first && first.parentElement ? { position: 'before', node: first } : null;
+      if (!first || !first.parentElement) return null;
+      // Keep the digest outside the result list when there is a clear list
+      // boundary. Reddit may replace the result rows during hydration.
+      var list = first.closest('[role="list"], [data-testid="search-results"], .search-result-listing, shreddit-feed');
+      var node = list && list !== first && list.parentElement &&
+        !list.querySelector('[role="tablist"], form, input, select') ? list : first;
+      return { position: 'before', node: node };
     }
     var feed = doc.querySelector('shreddit-feed');
     if (feed && feed.parentElement) return { position: 'before', node: feed };
@@ -3364,7 +3371,8 @@
   }
 
   function placeDigestBox(box, anchor) {
-    if (!box || !anchor || !anchor.node || !anchor.node.parentElement) return;
+    if (!box || !anchor || !anchor.node || !anchor.node.parentElement ||
+        anchor.node === box || (box.contains && box.contains(anchor.node))) return;
     if (anchor.position === 'before') {
       if (box.nextElementSibling === anchor.node) return;
       anchor.node.parentElement.insertBefore(box, anchor.node);
@@ -3604,9 +3612,20 @@
     if (typeof document === 'undefined') return;
     var info = subredditFeed(location.href);
     var existing = document.getElementById('rts-digest');
+    var search = info && info.kind === 'search';
+    if (!search && searchDigestBox) {
+      digestToken++;
+      searchDigestBox.remove();
+      if (existing === searchDigestBox) existing = null;
+      searchDigestBox = null;
+    }
     var allowed = info && (info.feedName ? multiDigestEnabled() : digestEnabled());
     if (!allowed) {
-      if (existing) { digestToken++; existing.remove(); }
+      if (existing || searchDigestBox) {
+        digestToken++;
+        if (existing) existing.remove();
+        searchDigestBox = null;
+      }
       return;
     }
     var anchor = findDigestAnchor(document, info);
@@ -3614,7 +3633,10 @@
       if (existing && existing.dataset.key !== digestCacheKey(info)) { digestToken++; existing.remove(); }
       return;
     }
-    var box = existing || buildDigestBox();
+    // Preserve both the rendered digest and its in-flight request if Reddit
+    // briefly removes the mounted card while rebuilding the result list.
+    var box = existing || (search && searchDigestBox) || buildDigestBox();
+    if (search) searchDigestBox = box;
     placeDigestBox(box, anchor);
     applyTheme(box);
     var key = digestCacheKey(info);
