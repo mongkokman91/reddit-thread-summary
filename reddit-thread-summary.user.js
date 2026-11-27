@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.1
+// @version      1.1.2
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -75,8 +75,11 @@
   var KEY_NO_INFINITE = 'rts.noInfinite';
   var FEED_MIN_COMMENTS = 5;
   var MIN_DISCUSSION_COMMENTS = 2;
-  var SUMMARY_TIMEOUT_MS = 60000;
+  var SUMMARY_TIMEOUT_MS = 180000;
+  var REQUEST_TIMEOUT_MS = 30000;
   var OVERLOAD_RETRY_MS = 2000;
+  var OVERLOAD_COOLDOWN_MS = 10 * 60 * 1000;
+  var KEY_BUSY_UNTIL = 'rts.modelBusyUntil';
   var FEED_JSON_CONCURRENCY = 2;
   var FEED_GEMINI_GAP_MS = 6000;
   var FEED_DWELL_MS = 1000;
@@ -1109,12 +1112,12 @@
     return 'saved ' + Math.round(hours / 24) + 'd ago';
   }
 
-  function abortLive() {
+  function abortLive(includeFeed) {
     var pending = liveRequests;
     var keep = [];
     liveRequests = [];
     pending.forEach(function (handle) {
-      if (handle && handle.feed) {
+      if (!includeFeed && handle && handle.feed) {
         keep.push(handle);
         return;
       }
@@ -1123,7 +1126,11 @@
     liveRequests = keep.concat(liveRequests);
   }
 
+  // Violentmonkey and Tampermonkey on Android often never call ontimeout or
+  // onerror when a Gemini POST stalls, and abort() does not reject it either.
+  // A deadline owned by this script settles the promise anyway.
   function gmRequest(details) {
+    var limit = details.timeout || REQUEST_TIMEOUT_MS;
     return new Promise(function (resolve, reject) {
       if (typeof GM_xmlhttpRequest !== 'function') {
         var missing = new Error('This script needs Tampermonkey or Violentmonkey.');
@@ -1131,46 +1138,51 @@
         reject(missing);
         return;
       }
-      var handle;
+      var settled = false;
+      var raw = null;
+      function finish(ok, value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (ok) resolve(value);
+        else reject(value);
+      }
+      function fail(type, message) {
+        var err = new Error(message);
+        err.type = type;
+        err.gemini = !!details.gemini;
+        if (details.gemini && (type === 'timeout' || type === 'network')) err.overloaded = true;
+        finish(false, err);
+      }
+      var timer = setTimeout(function () {
+        try { if (raw && raw.abort) raw.abort(); } catch (err) { /* ignore */ }
+        fail('timeout', 'The request timed out. Try again.');
+      }, limit);
       try {
-        handle = GM_xmlhttpRequest({
+        raw = GM_xmlhttpRequest({
           method: details.method,
           url: details.url,
           headers: details.headers,
           data: details.data,
-          timeout: details.timeout,
+          timeout: limit,
           anonymous: false,
-          onload: function (res) { resolve(res || {}); },
-          onerror: function () {
-            var err = new Error('Couldn\'t reach the network. Check your connection and try again.');
-            err.type = 'network';
-            reject(err);
-          },
-          ontimeout: function () {
-            var err = new Error('The request timed out. Try again.');
-            err.type = 'timeout';
-            reject(err);
-          },
-          onabort: function () {
-            var err = new Error('aborted');
-            err.type = 'abort';
-            reject(err);
-          }
+          onload: function (res) { finish(true, res || {}); },
+          onerror: function () { fail('network', 'Couldn\'t reach the network. Check your connection and try again.'); },
+          ontimeout: function () { fail('timeout', 'The request timed out. Try again.'); },
+          onabort: function () { fail('abort', 'aborted'); }
         });
       } catch (err) {
-        var failed = new Error('Couldn\'t start the request.');
-        failed.type = 'network';
-        reject(failed);
+        fail('network', 'Couldn\'t start the request.');
         return;
       }
-      if (handle && handle.abort) {
-        var wrapped = {
+      if (raw && raw.abort) {
+        liveRequests.push({
           feed: !!details.feed,
-          abort: function () { try { handle.abort(); } catch (err) { /* ignore */ } }
-        };
-        liveRequests.push(wrapped);
-      } else if (handle) {
-        liveRequests.push(handle);
+          abort: function () {
+            try { raw.abort(); } catch (err) { /* ignore */ }
+            fail('abort', 'aborted');
+          }
+        });
       }
     });
   }
@@ -1217,7 +1229,7 @@
           method: 'GET',
           url: urls[i],
           headers: { 'Accept': 'application/json' },
-          timeout: 20000,
+          timeout: REQUEST_TIMEOUT_MS,
           feed: !!feed
         });
         if (res.status === 200) return parseThread(parseJsonBody(res));
@@ -1269,8 +1281,9 @@
           'x-goog-api-key': key
         },
         data: JSON.stringify(geminiRequestBody(thread, model, useSystem, useThinking, systemText)),
-        timeout: 45000,
-        feed: !!feed
+          timeout: REQUEST_TIMEOUT_MS,
+          feed: !!feed,
+          gemini: true
       });
       if (res.status === 200) {
         var data;
@@ -1329,16 +1342,39 @@
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
-  // One attempt, and if Gemini is overloaded (500/503/UNAVAILABLE), one retry
-  // of the same model after a short wait. Quota errors are not retried here.
+  function modelBusy() {
+    var until = Number(gmGet(KEY_BUSY_UNTIL, 0));
+    return isFinite(until) && until > Date.now();
+  }
+
+  function markModelBusy() {
+    gmSet(KEY_BUSY_UNTIL, Date.now() + OVERLOAD_COOLDOWN_MS);
+  }
+
+  function clearModelBusy() {
+    gmSet(KEY_BUSY_UNTIL, 0);
+  }
+
+  function isOverloadError(err) {
+    return !!(err && (err.overloaded || (err.gemini && (err.type === 'timeout' || err.type === 'network'))));
+  }
+
+  // Retry a busy model once. A timeout or a second failure is final for this
+  // model so the caller can switch to flash-lite without waiting on a hung socket.
   async function generateOnceOrRetryOverload(thread, key, model, systemText, feed, onStatus) {
     try {
       return await generateWithModel(thread, key, model, systemText, feed);
     } catch (err) {
-      if (!(err && err.overloaded)) throw err;
+      if (!isOverloadError(err)) throw err;
+      if (model === DEFAULT_MODEL) markModelBusy();
       if (onStatus) onStatus(model + ' is busy. Retrying…');
       await delay(OVERLOAD_RETRY_MS);
-      return await generateWithModel(thread, key, model, systemText, feed);
+      try {
+        return await generateWithModel(thread, key, model, systemText, feed);
+      } catch (again) {
+        if (again) again.overloaded = true;
+        throw again || err;
+      }
     }
   }
 
@@ -1348,28 +1384,42 @@
     var model = requested;
     var skipped = '';
     var reason = '';
-    if (allowSessionFallback && requested === DEFAULT_MODEL && flash38Exhausted()) {
+    var skipBecauseBusy = requested === DEFAULT_MODEL && modelBusy();
+    var skipBecauseQuota = allowSessionFallback && requested === DEFAULT_MODEL && flash38Exhausted();
+    if (skipBecauseBusy || skipBecauseQuota) {
       model = FALLBACK_MODEL;
       skipped = requested;
-      reason = 'quota';
-      if (onStatus) onStatus('gemini-3.8-flash already hit its free-tier limit. Using gemini-3.5-flash-lite…');
+      reason = skipBecauseBusy ? 'overload' : 'quota';
+      if (onStatus) {
+        onStatus(skipBecauseBusy
+          ? 'gemini-3.8-flash was busy. Using gemini-3.5-flash-lite…'
+          : 'gemini-3.8-flash already hit its free-tier limit. Using gemini-3.5-flash-lite…');
+      }
     }
     try {
       var text = await generateOnceOrRetryOverload(thread, key, model, systemText, feed, onStatus);
-      if (model === DEFAULT_MODEL) clearFlash38Exhausted();
+      if (model === DEFAULT_MODEL) {
+        clearFlash38Exhausted();
+        clearModelBusy();
+      }
       return { text: text, model: model, fallbackFrom: skipped, fallbackReason: reason };
     } catch (err) {
-      var switchModel = err && (err.autoRetry || err.overloaded) && model !== FALLBACK_MODEL;
+      var switchModel = model !== FALLBACK_MODEL && (isOverloadError(err) || (err && err.autoRetry));
       if (!switchModel) throw err;
-      var why = err.overloaded ? 'overload' : 'quota';
+      var why = err && err.autoRetry && !isOverloadError(err) ? 'quota' : 'overload';
       if (why === 'quota') markFlash38Exhausted();
+      if (why === 'overload') markModelBusy();
       if (onStatus) {
         onStatus(why === 'overload'
-          ? model + ' is overloaded. Trying gemini-3.5-flash-lite…'
+          ? 'Retry failed. Trying gemini-3.5-flash-lite…'
           : 'gemini-3.8-flash is out of free requests. Trying gemini-3.5-flash-lite…');
       }
-      var retry = await generateOnceOrRetryOverload(thread, key, FALLBACK_MODEL, systemText, feed, onStatus);
-      return { text: retry, model: FALLBACK_MODEL, fallbackFrom: model, fallbackReason: why };
+      try {
+        var retry = await generateOnceOrRetryOverload(thread, key, FALLBACK_MODEL, systemText, feed, onStatus);
+        return { text: retry, model: FALLBACK_MODEL, fallbackFrom: model, fallbackReason: why };
+      } catch (fallbackErr) {
+        throw fallbackErr || err;
+      }
     }
   }
 
@@ -1803,21 +1853,26 @@
     }
 
     renderLoading(panel, 'Reading the thread…', undefined, hadPreview);
-    var timedOut = false;
+    var alive = true;
     var summaryTimer = setTimeout(function () {
-      timedOut = true;
-      abortLive();
-      if (my !== runToken) return;
+      if (!alive || my !== runToken) return;
+      alive = false;
+      abortLive(true);
+      if (!panel.isConnected || panel.dataset.postId !== postId) return;
+      if (panel.dataset.state === 'ready') return;
       renderProblem(panel, {
         type: 'timeout',
         message: 'The summary took too long. Try again.'
       });
     }, SUMMARY_TIMEOUT_MS);
+    function stillRunning() {
+      return alive && my === runToken && panel.dataset.state !== 'error' && panel.dataset.postId === postId;
+    }
     try {
       var thread = await fetchThread(location.href);
-      if (timedOut || my !== runToken) return;
+      if (!stillRunning()) return;
       thread = await useOriginalThread(thread, false);
-      if (timedOut || my !== runToken) return;
+      if (!stillRunning()) return;
       if (discussionIsThin(thread)) {
         var emptyRec = {
           markdown: emptyDiscussionText(thread),
@@ -1828,17 +1883,18 @@
           sourceNote: thread.sourceNote || ''
         };
         writeCache(postId, model, emptyRec);
+        if (!stillRunning()) return;
         renderReady(panel, emptyRec, false);
         return;
       }
       renderLoading(panel, 'Writing the TL;DR…', thread.commentCount, hadPreview);
       if (thread.sourceNote) setNote(panel, 'Not a mod comment · ' + thread.sourceNote);
       var generated = await callGemini(thread, key, model, function (message) {
-        if (timedOut || my !== runToken) return;
+        if (!stillRunning()) return;
         renderLoading(panel, message, thread.commentCount, true);
         if (thread.sourceNote) setNote(panel, 'Not a mod comment · ' + thread.sourceNote);
       }, !opts.force);
-      if (timedOut || my !== runToken) return;
+      if (!stillRunning()) return;
       var raw = generated.text;
       var markdown = prepareSummary(raw, thread);
       if (!markdown) {
@@ -1866,12 +1922,20 @@
           sourceNote: thread.sourceNote || ''
         });
       }
-      if (timedOut || my !== runToken) return;
+      if (!stillRunning()) return;
       renderReady(panel, rec, false);
     } catch (err) {
-      if (timedOut || my !== runToken || (err && err.type === 'abort')) return;
+      if (!alive || my !== runToken || panel.dataset.state === 'error') return;
+      if (err && err.type === 'abort') {
+        renderProblem(panel, {
+          type: 'timeout',
+          message: 'The summary took too long. Try again.'
+        });
+        return;
+      }
       renderProblem(panel, err);
     } finally {
+      alive = false;
       clearTimeout(summaryTimer);
     }
   }
@@ -2798,6 +2862,10 @@
       FEED_DWELL_MS: FEED_DWELL_MS,
       SUMMARY_TIMEOUT_MS: SUMMARY_TIMEOUT_MS,
       OVERLOAD_RETRY_MS: OVERLOAD_RETRY_MS,
+      REQUEST_TIMEOUT_MS: REQUEST_TIMEOUT_MS,
+      gmRequest: gmRequest,
+      modelBusy: modelBusy,
+      markModelBusy: markModelBusy,
       discussionIsThin: discussionIsThin,
       emptyDiscussionText: emptyDiscussionText,
       crosspostJsonUrls: crosspostJsonUrls,

@@ -122,9 +122,9 @@ A recap is saved per post for six hours. Opening that thread shows the saved rec
 
 `https://raw.githubusercontent.com/mongkokman91/reddit-thread-summary/main/reddit-thread-summary.user.js`
 
-Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.1`.
+Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.2`.
 
-A crosspost is summarized from the original thread, labeled with that subreddit. If that discussion is empty too, the card says "No comments to summarize yet" instead of waiting on Gemini. A summary that runs longer than about a minute stops with **Try again**. If Gemini answers 503, 500, or that the model is overloaded, the script retries once and then uses `gemini-3.5-flash-lite`, and the card says which model wrote it.
+If Gemini says `gemini-3.8-flash` is busy, the script retries that model once, then switches to `gemini-3.5-flash-lite` and says which model wrote the summary. A request that never answers is cut off after 30 seconds, so a stalled retry cannot sit on “Retrying…” forever. After a 503, later thread and feed summaries use Flash-Lite for about 10 minutes. If Flash-Lite also fails, the card shows the error and **Try again**. The overall wait is capped at about three minutes and always ends as a summary or an error.
 
 ## Privacy
 
