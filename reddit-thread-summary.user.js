@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.3
+// @version      1.1.4
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -2936,8 +2936,8 @@
       var sub = match[1];
       if (sub.indexOf('+') !== -1) return null;
       if (AGGREGATE_SUBS[sub.toLowerCase()]) return null;
-      var sort = (match[2] || url.searchParams.get('sort') || 'hot').toLowerCase();
-      if (!DIGEST_SORTS[sort]) sort = 'hot';
+      var sort = (match[2] || url.searchParams.get('sort') || 'best').toLowerCase();
+      if (!DIGEST_SORTS[sort]) sort = 'best';
       var windowName = '';
       if (sort === 'top' || sort === 'controversial') {
         windowName = (url.searchParams.get('t') || 'day').toLowerCase();
@@ -3003,9 +3003,11 @@
   }
 
   function digestSource(info, posts) {
+    var sortName = info.usedSort || info.sort;
+    var windowName = sortName === info.sort ? info.t : '';
     var lines = [
       'Subreddit: r/' + info.sub,
-      'Sort: ' + info.sort + (info.t ? ' (' + info.t + ')' : ''),
+      'Sort: ' + sortName + (windowName ? ' (' + windowName + ')' : ''),
       ''
     ];
     posts.forEach(function (post, index) {
@@ -3090,23 +3092,47 @@
     return path;
   }
 
+  async function loadDigestListing(info) {
+    var payload = await fetchRedditJson(listingPath(info), 'digest', { sub: info.sub });
+    return parseSubredditListing(payload);
+  }
+
   async function fetchDigestPosts(info) {
     var posts = [];
     var fromDom = false;
+    var usedSort = info.sort;
+    var loadError = null;
     try {
-      var payload = await fetchRedditJson(listingPath(info), 'digest', { sub: info.sub });
-      posts = parseSubredditListing(payload);
+      posts = await loadDigestListing(info);
     } catch (err) {
-      posts = scrapeDigestPosts(typeof document !== 'undefined' ? document : null);
-      fromDom = true;
-      if (!posts.length) {
-        var failed = new Error("Couldn't load r/" + info.sub + "'s post list" +
-          (err && err.status ? ' (HTTP ' + err.status + ')' : '') + '.');
-        failed.status = err && err.status;
-        failed.type = 'reddit';
-        throw failed;
+      loadError = err;
+      if (info.sort === 'best') {
+        try {
+          posts = await loadDigestListing({ sub: info.sub, sort: 'hot', t: '' });
+          usedSort = 'hot';
+          loadError = null;
+        } catch (hotErr) {
+          loadError = hotErr;
+          posts = [];
+        }
       }
     }
+    if (!posts || !posts.length) {
+      var scraped = scrapeDigestPosts(typeof document !== 'undefined' ? document : null);
+      if (scraped.length) {
+        posts = scraped;
+        fromDom = true;
+        usedSort = info.sort;
+      }
+    }
+    if (!posts || !posts.length) {
+      var failed = new Error("Couldn't load r/" + info.sub + "'s post list" +
+        (loadError && loadError.status ? ' (HTTP ' + loadError.status + ')' : '') + '.');
+      failed.status = loadError && loadError.status;
+      failed.type = 'reddit';
+      throw failed;
+    }
+    info.usedSort = usedSort;
     if (fromDom) return posts;
     var ranked = posts.filter(function (post) {
       return post.comments >= 3 && post.permalink;
@@ -3244,6 +3270,13 @@
     button.setAttribute('aria-label', collapsed ? 'Expand digest' : 'Collapse digest');
   }
 
+  function digestHeading(sub, sort, windowName) {
+    var name = sort || 'best';
+    var label = name.charAt(0).toUpperCase() + name.slice(1);
+    if (windowName) label += ' · ' + windowName;
+    return 'What r/' + sub + ' is talking about (' + label + ')';
+  }
+
   function digestSortLabel(info) {
     return info.sort + (info.t ? ' · ' + info.t : '');
   }
@@ -3272,8 +3305,10 @@
     if (status) status.classList.add('rts-hidden');
     if (error) error.classList.add('rts-hidden');
     if (summary) summary.innerHTML = renderMarkdown(rec.markdown || '');
+    var title = box.querySelector('.rts-title');
+    if (title && rec.sub) title.textContent = digestHeading(rec.sub, rec.sort, rec.t);
     if (note) {
-      var bits = [digestSortLabel({ sort: rec.sort || '', t: rec.t || '' })];
+      var bits = [];
       if (rec.model) bits.push(rec.model);
       if (rec.fallbackFrom) bits.push(rec.fallbackReason === 'overload' ? rec.fallbackFrom + ' was busy' : rec.fallbackFrom + ' hit its daily limit');
       if (rec.cachedAt) bits.push(ageLabel(rec.cachedAt));
@@ -3298,12 +3333,12 @@
     var keyName = digestCacheKey(info);
     box.dataset.key = keyName;
     var title = box.querySelector('.rts-title');
-    if (title) title.textContent = 'What r/' + info.sub + ' is talking about';
+    if (title) title.textContent = digestHeading(info.sub, info.sort, info.t);
     if (!force) {
       var cached = readDigestCache(keyName);
       if (cached && my === digestToken) {
-        cached.sort = info.sort;
-        cached.t = info.t;
+        if (!cached.sub) cached.sub = info.sub;
+        if (!cached.sort) cached.sort = info.sort;
         showDigest(box, cached);
         return;
       }
@@ -3355,8 +3390,9 @@
         model: generated.model,
         fallbackFrom: generated.fallbackFrom || '',
         fallbackReason: generated.fallbackReason || '',
-        sort: info.sort,
-        t: info.t || ''
+        sort: info.usedSort || info.sort,
+        t: info.usedSort && info.usedSort !== info.sort ? '' : (info.t || ''),
+        sub: info.sub
       };
       writeDigestCache(keyName, rec);
       if (!alive || my !== digestToken) return;
