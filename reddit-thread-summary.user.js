@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.5
+// @version      1.1.7
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -2287,7 +2287,74 @@
     return parseCommentCount(link.textContent || '');
   }
 
+  // Shreddit search uses result rows, not the feed's <shreddit-post>.
+  var SEARCH_ROW = 'search-result-post, shreddit-search-result-post, search-telemetry-tracker-view, [data-testid="search-post"], [data-testid="search-result-post"], [data-testid="post-container"], article, .search-result-link';
+  var SEARCH_LINK = 'a[href*="/comments/"]';
+
+  function searchPostLink(link, base) {
+    if (!link) return null;
+    try {
+      var url = new URL(link.getAttribute('href') || '', base);
+      if (url.protocol !== 'https:' || !HOSTS[url.hostname]) return null;
+      // Reject direct comment links and links to external sites.
+      var match = url.pathname.match(/^\/r\/([^/]+)\/comments\/([a-z0-9]+)(?:\/[^/]+)?\/?$/i);
+      if (!match) return null;
+      return { id: match[2].toLowerCase(), url: url.origin + url.pathname, sub: match[1] };
+    } catch (err) { return null; }
+  }
+
+  function searchResultCards(doc, href) {
+    if (!doc || !doc.querySelectorAll) return [];
+    var scope = doc.querySelector('main, [role="main"], #main-content, .search-result-listing, #siteTable') || doc.body || doc;
+    var candidates = scope.querySelectorAll(SEARCH_LINK);
+    var best = Object.create(null);
+    var order = [];
+    for (var i = 0; i < candidates.length; i++) {
+      var link = candidates[i];
+      if (link.closest('.rts-feed, .rts-digest, aside, nav, shreddit-ad, [data-testid="search-comment"]')) continue;
+      var info = searchPostLink(link, href);
+      var title = oneLine(link.textContent || '', 160);
+      if (!info || !title || parseCommentCount(title) != null) continue;
+      var explicit = link.matches('a.title, a.search-title, [slot="title"], [data-testid*="post-title"], h2 a, h3 a, h4 a') || !!link.querySelector('h2,h3,h4');
+      if (!best[info.id]) order.push(info.id);
+      var score = (explicit ? 1000 : 0) + title.length;
+      if (best[info.id] && best[info.id].score >= score) continue;
+      best[info.id] = { link: link, info: info, title: title, score: score };
+    }
+    var rows = [];
+    order.forEach(function (id) {
+      var result = best[id];
+      var row = result.link.closest('shreddit-post, ' + SEARCH_ROW);
+      function onlyThisPost(node) {
+        var links = node.querySelectorAll(SEARCH_LINK);
+        for (var j = 0; j < links.length; j++) {
+          if (links[j].closest('.rts-feed, .rts-digest')) continue;
+          var other = searchPostLink(links[j], href);
+          if (other && other.id !== id) return false;
+        }
+        return true;
+      }
+      if (!row || row === scope || !onlyThisPost(row)) {
+        // Unknown markup: climb to the row, but never wrap the whole list,
+        // search controls, or a container holding another result.
+        row = result.link;
+        for (var i = 0; i < 6; i++) {
+          var parent = row.parentElement;
+          if (!parent || parent === scope || parent.matches('main, [role="main"], [role="list"], [role="tabpanel"], ul, ol, shreddit-feed') ||
+              parent.querySelector('[role="tablist"], form, input, select') || !onlyThisPost(parent)) break;
+          row = parent;
+          if (row.matches('li, [role="listitem"]')) break;
+        }
+      }
+      if (isPromotedCard(row)) return;
+      row.__rtsSearchResult = result;
+      rows.push(row);
+    });
+    return rows;
+  }
+
   function cardPostId(el) {
+    if (el && el.__rtsSearchResult) return el.__rtsSearchResult.info.id;
     var id = elementPostId(el);
     if (id) return id;
     if (!el || !el.querySelectorAll) return '';
@@ -2300,6 +2367,7 @@
   }
 
   function cardPermalink(el) {
+    if (el && el.__rtsSearchResult) return el.__rtsSearchResult.info.url;
     var base = 'https://www.reddit.com/';
     try { if (typeof location !== 'undefined' && location.href) base = location.href; } catch (err) { /* keep base */ }
     var direct = el && el.getAttribute ? (el.getAttribute('permalink') || el.getAttribute('content-href') || '') : '';
@@ -2460,8 +2528,9 @@
     card.__rtsDwell = setTimeout(function () {
       card.__rtsDwell = 0;
       if (feedObserver) {
-        try { feedObserver.unobserve(card); } catch (err) { /* already gone */ }
+        try { feedObserver.unobserve(card.__rtsObservedNode || card); } catch (err) { /* already gone */ }
       }
+      if (!card.isConnected) return;
       card.setAttribute('data-rts-watched', '1');
       onCardVisible(card);
     }, FEED_DWELL_MS);
@@ -2546,7 +2615,13 @@
       if (!feedEnabled()) return;
       thread = await useOriginalThread(thread, true);
       if (!feedEnabled()) return;
-      if (thread.commentCount < FEED_MIN_COMMENTS) {
+      if (item.search && !thread.commentCount) {
+        var emptyBox = ensureItemBox(item);
+        if (emptyBox) fillFeedBox(emptyBox, { markdown: 'No comments to recap yet.' });
+        delete feedQueued[item.postId];
+        return;
+      }
+      if (!item.search && thread.commentCount < FEED_MIN_COMMENTS) {
         if (thread.crosspost || thread.sourceNote) {
           var note = discussionIsThin(thread)
             ? emptyDiscussionText(thread)
@@ -2634,9 +2709,10 @@
     try { href = location.href; } catch (err) { href = ''; }
     if (threadIdFromUrl(href) === id) return;
     var known = commentCountFromCard(card);
-    var quiet = known != null && known < FEED_MIN_COMMENTS;
+    var search = !!card.__rtsSearchResult;
+    var quiet = !search && known != null && known < FEED_MIN_COMMENTS;
     var cached = readFeedCache(id);
-    if (cached && cached.skip) return;
+    if (cached && cached.skip && !search) return;
     if (!cached || !cached.markdown) {
       var fromThread = readThreadSummaryForFeed(id);
       if (fromThread) cached = fromThread;
@@ -2667,7 +2743,7 @@
     if (feedQueued[id]) return;
     showFeedLoading(box);
     feedQueued[id] = true;
-    feedQueue.push({ postId: id, href: cardPermalink(card), box: box, attempts: 0 });
+    feedQueue.push({ postId: id, href: cardPermalink(card), box: box, card: card, attempts: 0, search: search });
     pumpFeed();
   }
 
@@ -2688,8 +2764,9 @@
         if (!feedObserver) return;
         // Stay observed until the card has been on screen for a second.
         // Scrolling past cancels the timer and does not queue a recap.
-        if (entry.isIntersecting) startDwell(entry.target);
-        else cancelDwell(entry.target);
+        var card = entry.target.__rtsObservationCard || entry.target;
+        if (entry.isIntersecting) startDwell(card);
+        else cancelDwell(card);
       });
     }, { root: null, rootMargin: '0px', threshold: 0 });
     return feedObserver;
@@ -2702,7 +2779,10 @@
       return;
     }
     var observer = ensureFeedObserver();
-    var cards = document.querySelectorAll('shreddit-post, div.thing.link, div.search-result-link');
+    var info = subredditFeed(location.href);
+    if (/\/search\/?$/i.test(location.pathname) && (!info || info.kind !== 'search')) return;
+    var cards = info && info.kind === 'search' ? searchResultCards(document, location.href)
+      : document.querySelectorAll('shreddit-post, div.thing.link, div.search-result-link');
     for (var i = 0; i < cards.length; i++) {
       var card = cards[i];
       if (card.getAttribute('data-rts-watched') === '1') continue;
@@ -2718,7 +2798,10 @@
       if (observer) {
         if (card.getAttribute('data-rts-watching') !== '1') {
           card.setAttribute('data-rts-watching', '1');
-          observer.observe(card);
+          var target = card.__rtsSearchResult ? card.__rtsSearchResult.link : card;
+          card.__rtsObservedNode = target;
+          if (target !== card) target.__rtsObservationCard = card;
+          observer.observe(target);
         }
       } else if (cardInView(card)) {
         startDwell(card);
@@ -2915,9 +2998,9 @@
   var DIGEST_WINDOWS = { hour: true, day: true, week: true, month: true, year: true, all: true };
   var AGGREGATE_SUBS = { popular: true, all: true, friends: true, mod: true, random: true, randnsfw: true };
   var DIGEST_PROMPT = [
-    'You write a digest of a single subreddit feed for someone who has not opened the posts.',
+    'You write a digest of a Reddit feed or its matching search results for someone who has not opened the posts.',
     'Return markdown only. No code fence. No preamble.',
-    '1. One paragraph of 2 or 3 sentences: what this subreddit is talking about in this listing. Bold the key topics.',
+    '1. One paragraph of 2 or 3 sentences: what these listed posts are about. Bold the key topics. For search, cover only matching posts and do not imply that you read comments unless provided.',
     '2. Then 3 to 5 bullets. Each starts with **Theme name:** and names the relevant posts as markdown links using the exact URLs given below. Group posts that belong together. Do not invent posts or links.',
     '3. Then a heading line exactly **Actionable takeaways** and 1 to 4 bullets. Always include this section. On a light or joke listing, a takeaway can be the vibe or the post most worth opening. Do not pad.',
     'If this is a custom feed or a combined list of communities, group themes across subreddits and tag each theme and each post with its subreddit, like r/ChatGPT.',
@@ -2958,6 +3041,15 @@
       var url = new URL(href);
       if (!HOSTS[url.hostname]) return null;
       if (/\/comments\//i.test(url.pathname)) return null;
+      var search = url.pathname.match(/^\/(?:r\/([a-z0-9_]+)\/)?search\/?$/i);
+      if (search) {
+        var query = (url.searchParams.get('q') || '').trim();
+        var type = (url.searchParams.get('type') || 'posts').toLowerCase();
+        if (!query || ['posts', 'link'].indexOf(type) < 0) return null;
+        return { kind: 'search', sub: search[1] || '', query: query,
+          sort: url.searchParams.get('sort') || 'relevance', t: url.searchParams.get('t') || '',
+          scope: url.searchParams.get('restrict_sr') || '' };
+      }
       var multi = url.pathname.match(/^\/(?:user\/([^/]+)\/m|me\/m)\/([^/]+)(?:\/(hot|new|top|rising|controversial|best))?\/?$/i);
       if (multi) {
         var timing = sortFromUrl(url, multi[3]);
@@ -2996,6 +3088,7 @@
   }
 
   function digestCacheKey(info) {
+    if (info.kind === 'search') return 'rts.digest.search.' + encodeURIComponent(JSON.stringify([info.sub.toLowerCase(), info.query, info.sort, info.t, info.scope]));
     var id = info.sub.toLowerCase();
     if (info.kind === 'user-multi') id = 'multi.' + info.user.toLowerCase() + '.' + info.name.toLowerCase();
     else if (info.kind === 'me-multi') id = 'multi.me.' + info.name.toLowerCase();
@@ -3059,7 +3152,8 @@
     var sortName = info.usedSort || info.sort;
     var windowName = sortName === info.sort ? info.t : '';
     var lines = [
-      info.feedName ? 'Custom feed: ' + info.feedName : 'Subreddit: r/' + info.sub,
+      info.kind === 'search' ? 'Matching search posts' + (info.sub ? ' in r/' + info.sub : '') :
+        (info.feedName ? 'Custom feed: ' + info.feedName : 'Subreddit: r/' + info.sub),
       'Sort: ' + sortName + (windowName ? ' (' + windowName + ')' : ''),
       ''
     ];
@@ -3070,7 +3164,7 @@
       var where = post.subreddit ? 'r/' + post.subreddit + ': ' : '';
       lines.push((index + 1) + '. ' + where + post.title);
       if (url) lines.push('url: ' + url);
-      lines.push('score ' + post.score + ', ' + post.comments + ' comments' + (post.flair ? ', flair ' + post.flair : ''));
+      if (info.kind !== 'search') lines.push('score ' + post.score + ', ' + post.comments + ' comments' + (post.flair ? ', flair ' + post.flair : ''));
       if (post.selftext) lines.push('body: ' + post.selftext);
       if (post.commentsText) lines.push('top comments: ' + post.commentsText);
       lines.push('');
@@ -3173,6 +3267,14 @@
   }
 
   async function fetchDigestPosts(info) {
+    if (info.kind === 'search') {
+      // Use the results the user is actually seeing, not another listing or
+      // an extra search request. This costs one digest call on the feed model.
+      return searchResultCards(document, location.href).slice(0, DIGEST_POSTS).map(function (card) {
+        var row = card.__rtsSearchResult;
+        return { title: row.title, permalink: row.info.url, subreddit: row.info.sub };
+      });
+    }
     var posts = [];
     var fromDom = false;
     var usedSort = info.sort;
@@ -3247,7 +3349,11 @@
     await Promise.all(workers);
   }
 
-  function findDigestAnchor(doc) {
+  function findDigestAnchor(doc, info) {
+    if (info && info.kind === 'search') {
+      var first = searchResultCards(doc, location.href)[0];
+      return first && first.parentElement ? { position: 'before', node: first } : null;
+    }
     var feed = doc.querySelector('shreddit-feed');
     if (feed && feed.parentElement) return { position: 'before', node: feed };
     var header = doc.querySelector('shreddit-subreddit-header');
@@ -3355,6 +3461,7 @@
   }
 
   function digestHeading(info) {
+    if (info && info.kind === 'search') return 'AI digest of search results' + (info.sub ? ' in r/' + info.sub : '');
     var name = (info && info.sort) || 'best';
     var label = name.charAt(0).toUpperCase() + name.slice(1);
     if (info && info.t) label += ' · ' + info.t;
@@ -3391,7 +3498,7 @@
     if (error) error.classList.add('rts-hidden');
     if (summary) summary.innerHTML = renderMarkdown(rec.markdown || '');
     var title = box.querySelector('.rts-title');
-    if (title && (rec.sub || rec.feedName)) title.textContent = digestHeading(rec);
+    if (title && (rec.kind === 'search' || rec.sub || rec.feedName)) title.textContent = digestHeading(rec);
     if (note) {
       var bits = [];
       if (rec.model) bits.push(rec.model);
@@ -3428,7 +3535,7 @@
         return;
       }
     }
-    showDigestStatus(box, 'Reading r/' + info.sub + '…');
+    showDigestStatus(box, info.kind === 'search' ? 'Reading search results…' : 'Reading r/' + info.sub + '…');
     var alive = true;
     var timer = setTimeout(function () {
       if (!alive || box.dataset.key !== keyName) return;
@@ -3478,6 +3585,7 @@
         sort: info.usedSort || info.sort,
         t: info.usedSort && info.usedSort !== info.sort ? '' : (info.t || ''),
         sub: info.sub,
+        kind: info.kind,
         feedName: info.feedName || ''
       };
       writeDigestCache(keyName, rec);
@@ -3498,11 +3606,14 @@
     var existing = document.getElementById('rts-digest');
     var allowed = info && (info.feedName ? multiDigestEnabled() : digestEnabled());
     if (!allowed) {
-      if (existing) existing.remove();
+      if (existing) { digestToken++; existing.remove(); }
       return;
     }
-    var anchor = findDigestAnchor(document);
-    if (!anchor) return;
+    var anchor = findDigestAnchor(document, info);
+    if (!anchor) {
+      if (existing && existing.dataset.key !== digestCacheKey(info)) { digestToken++; existing.remove(); }
+      return;
+    }
     var box = existing || buildDigestBox();
     placeDigestBox(box, anchor);
     applyTheme(box);
@@ -3652,6 +3763,7 @@
       commentCountFromCard: commentCountFromCard,
       cardPostId: cardPostId,
       cardPermalink: cardPermalink,
+      searchResultCards: searchResultCards,
       nextGeminiTime: nextGeminiTime,
       readFeedCache: readFeedCache,
       writeFeedCache: writeFeedCache,
