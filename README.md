@@ -85,7 +85,8 @@ Open the userscript menu from Lemur's extensions grid: Tampermonkey or Violentmo
 - **Custom model id…** — paste any other model id. Type `default` to go back to `gemini-3.8-flash`.
 - **Feed recaps** — on by default. Turn it off to stop the boxes under feed cards.
 - **Set feed model** — defaults to `gemini-3.5-flash-lite`. Type `default` to reset.
-- **Subreddit digest** — on by default. A digest at the top of a single subreddit’s feed. It stays off home, r/popular, r/all, and multireddits.
+- **Subreddit digest** — on by default. A digest at the top of a single subreddit’s feed. It stays off home, r/popular, and r/all.
+- **Digest on custom feeds** — on by default. The same digest on your multireddits, such as `/user/you/m/ai`, `/me/m/ai`, and `/r/a+b+c`.
 - **Clear saved summaries** — forget the six-hour cache.
 - **Refresh this summary** — fetch the thread and write a new TL;DR.
 
@@ -114,7 +115,9 @@ A recap is saved per post for six hours. Opening that thread shows the saved rec
 
 ## Subreddit digest
 
-On a single subreddit’s feed, such as `https://www.reddit.com/r/GeminiAI/` or the same page on old Reddit, a **Subreddit digest** appears under the subreddit header and above the posts. New Reddit’s default sort is Best, so a feed with no sort in the URL is rounded up from `/r/X/best.json`. If Best is not available, it tries Hot and then the posts already on the page, which are in Best order. An explicit sort (`/new`, `/top?t=week`, `/rising`, `/controversial`, `/hot`) is what gets fetched. The heading names that sort, for example “What r/GeminiAI is talking about (Best)”. It does not appear on home, r/popular, r/all, or a multireddit.
+On a single subreddit’s feed, such as `https://www.reddit.com/r/GeminiAI/` or the same page on old Reddit, a **Subreddit digest** appears under the subreddit header and above the posts. The same box appears on a custom feed or multireddit: `/user/<name>/m/<feed>`, `/me/m/<feed>`, `old.reddit.com/user/<name>/m/<feed>`, and a combined URL such as `/r/ChatGPT+ClaudeAI`. Home, r/popular, and r/all stay excluded. **Digest on custom feeds** in the menu turns the multireddit box off; it starts on.
+
+New Reddit’s default sort is Best, so a feed with no sort in the URL is rounded up from `best.json`, including a private custom feed, which is requested with your logged-in session. If Best is not available, it tries Hot and then the posts already on the page. An explicit sort (`/new`, `/top?t=week`, `/rising`, `/controversial`, `/hot`) is what gets fetched. A subreddit heading looks like “What r/GeminiAI is talking about (Best)”. A custom feed heading looks like “What your AI feed is talking about (Best)”. Themes on a custom feed name the subreddit each post came from.
 
 The digest is one Gemini call, using the feed model (`gemini-3.5-flash-lite` unless you changed it), with the same retry and Flash-Lite fallback as other summaries. It reads about 25 posts (title, a snippet of the post, score, comment count, flair) and a couple of top comments from the most-discussed posts. You get a short “what r/X is talking about” paragraph, 3–5 themes that link the posts, and **Actionable takeaways**. It is cached per subreddit and sort for six hours. Tap the heading to collapse it; that choice is remembered. **↻** refreshes it. **Subreddit digest** in the menu turns it off. The per-post recaps underneath stay as they are.
 
@@ -128,7 +131,7 @@ The digest is one Gemini call, using the feed model (`gemini-3.5-flash-lite` unl
 
 `https://raw.githubusercontent.com/mongkokman91/reddit-thread-summary/main/reddit-thread-summary.user.js`
 
-Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.4`.
+Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.5`.
 
 Reddit's post list and thread JSON are requested from the page itself, with the browser session, because the extension request on Android was getting a 403 even while you were logged in. If that is blocked, the script tries the extension and then old Reddit. A digest can still be written from the posts already on the screen. A 403 says it could not load that subreddit's post list, and mentions NSFW or quarantine only when the post is actually marked that way. The digest heading, refresh button, and collapse caret stay on one line.
 
