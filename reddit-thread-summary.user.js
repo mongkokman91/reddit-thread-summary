@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.2
+// @version      1.1.3
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -358,19 +358,23 @@
     '  --rts-link: #8ecbff; --rts-danger: #ff9b93;',
     '}',
     '#rts-digest * { box-sizing: border-box; }',
-    '#rts-digest .rts-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }',
+    '#rts-digest .rts-head {',
+    '  display: flex !important; flex-wrap: nowrap !important; align-items: center; gap: 4px;',
+    '}',
+    '#rts-digest .rts-head-text { flex: 1 1 auto; min-width: 0; }',
     '#rts-digest .rts-badge {',
     '  display: inline-flex; align-items: center; height: 22px; padding: 0 8px;',
     '  border-radius: 999px; background: var(--rts-chip); color: var(--rts-accent);',
     '  font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;',
     '}',
-    '#rts-digest .rts-note { flex: 1 1 120px; color: var(--rts-muted); font-size: 12px; }',
+    '#rts-digest .rts-note { display: block; margin: 4px 0 0; color: var(--rts-muted); font-size: 12px; }',
     '#rts-digest .rts-iconbtn {',
     '  appearance: none; border: 0; background: transparent; color: var(--rts-fg);',
-    '  width: 44px; height: 44px; margin: -6px 0; border-radius: 10px;',
-    '  font: inherit; font-size: 18px; cursor: pointer;',
+    '  flex: 0 0 44px; width: 44px !important; max-width: 44px; height: 44px;',
+    '  border-radius: 10px; font: inherit; font-size: 18px; line-height: 44px;',
+    '  cursor: pointer; padding: 0;',
     '}',
-    '#rts-digest .rts-title { margin: 2px 0 10px; font-size: 17px !important; line-height: 1.35 !important; font-weight: 700 !important; cursor: pointer; }',
+    '#rts-digest .rts-title { margin: 2px 0 0; font-size: 17px !important; line-height: 1.35 !important; font-weight: 700 !important; cursor: pointer; }',
     '#rts-digest[data-collapsed="true"] .rts-body { display: none !important; }',
     '#rts-digest .rts-hidden { display: none !important; }',
     '#rts-digest .rts-status { margin: 0 0 8px; color: var(--rts-muted); }',
@@ -1234,63 +1238,189 @@
     });
   }
 
-  function redditHttpError(status) {
-    var err = new Error('Couldn\'t load the thread.');
+  function redditTarget(kind, meta) {
+    if (kind === 'digest') return "r/" + ((meta && meta.sub) || 'this subreddit') + "'s post list";
+    if (kind === 'feed') return 'this post';
+    return 'this thread';
+  }
+
+  function threadLooksGated() {
+    try {
+      if (typeof document === 'undefined' || !isThreadUrl(location.href)) return false;
+      var post = document.querySelector('shreddit-post');
+      if (post) {
+        var flag = String(post.getAttribute('over18') || post.getAttribute('nsfw') || post.getAttribute('over-18') || '').toLowerCase();
+        if (flag === 'true' || flag === '1') return true;
+      }
+      if (document.querySelector('.thing.link.over18, .thing.over18, .quarantine-interstitial')) return true;
+    } catch (err) { /* not on a thread page */ }
+    return false;
+  }
+
+  function redditHttpError(status, kind, meta) {
+    kind = kind || 'thread';
+    meta = meta || {};
+    var target = redditTarget(kind, meta);
+    var err = new Error("Couldn't load " + target + ".");
     err.type = 'reddit';
-    err.status = status;
+    err.status = status || 0;
+    var gated = !!(meta.over18 || meta.over_18 || meta.quarantine);
+    if (!gated && kind === 'thread') gated = threadLooksGated();
     if (status === 403) {
-      err.message = 'Reddit didn\'t return this thread (HTTP 403). NSFW or quarantined posts need you to be logged in. Open the thread, then refresh the summary.';
+      err.message = "Couldn't load " + target + " (HTTP 403).";
+      if (gated) {
+        err.message += kind === 'thread'
+          ? ' This post is marked NSFW or quarantined. Open it while logged in, then try again.'
+          : ' This community is marked NSFW or quarantined.';
+      }
     } else if (status === 404) {
-      err.message = 'Reddit couldn\'t find this thread.';
+      err.message = "Couldn't find " + target + ".";
     } else if (status === 429) {
-      err.message = 'Reddit is rate-limiting requests. Wait a minute, then refresh the summary.';
+      err.message = "Reddit is rate-limiting " + target + ". Wait a minute, then try again.";
     } else if (status) {
-      err.message = 'Couldn\'t load the thread (HTTP ' + status + ').';
-    } else {
-      err.message = 'Couldn\'t load the thread.';
+      err.message = "Couldn't load " + target + " (HTTP " + status + ").";
     }
     return err;
   }
 
-  function parseJsonBody(res) {
+  function looksLikeJson(text) {
+    var trimmed = String(text || '').trim();
+    return trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[';
+  }
+
+  function parseJsonBody(res, kind, meta) {
     var text = res && res.responseText ? res.responseText : '';
-    if (!text || text.charAt(0) === '<') {
-      var page = redditHttpError(res && res.status);
-      page.message = 'Reddit returned a page instead of the thread.';
+    if (!looksLikeJson(text)) {
+      var page = redditHttpError((res && res.status) || 403, kind, meta);
+      if (!res || !res.status || res.status === 200) page.message = "Reddit didn't return JSON for " + redditTarget(kind, meta) + ".";
       throw page;
     }
     try {
       return JSON.parse(text);
     } catch (err) {
-      var bad = redditHttpError(res && res.status);
-      bad.message = 'Reddit returned something that wasn\'t the thread.';
+      var bad = redditHttpError(res && res.status, kind, meta);
+      bad.message = "Reddit returned something that wasn't JSON for " + redditTarget(kind, meta) + ".";
       throw bad;
     }
   }
 
-  async function fetchJsonListing(urls, feed) {
-    var lastError = null;
-    for (var i = 0; i < urls.length; i++) {
-      try {
-        var res = await gmRequest({
-          method: 'GET',
-          url: urls[i],
-          headers: { 'Accept': 'application/json' },
-          timeout: REQUEST_TIMEOUT_MS,
-          feed: !!feed
+  function pageOrigin() {
+    try {
+      if (typeof location !== 'undefined' && location.origin && HOSTS[location.hostname]) return location.origin;
+    } catch (err) { /* fall through */ }
+    return 'https://www.reddit.com';
+  }
+
+  function ensureRawJson(search) {
+    if (!search) return '?raw_json=1';
+    if (/[?&]raw_json=/.test(search)) return search;
+    return search + '&raw_json=1';
+  }
+
+  function pathFromRedditUrl(absolute) {
+    var url = new URL(absolute, 'https://www.reddit.com');
+    return url.pathname + ensureRawJson(url.search);
+  }
+
+  function pageFetch(url) {
+    return new Promise(function (resolve, reject) {
+      if (typeof fetch !== 'function') {
+        var missing = new Error("Couldn't reach Reddit from the page.");
+        missing.type = 'network';
+        missing.status = 0;
+        reject(missing);
+        return;
+      }
+      var settled = false;
+      var controller = typeof AbortController === 'function' ? new AbortController() : null;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        try { if (controller) controller.abort(); } catch (err) { /* ignore */ }
+        var timeout = new Error('The request timed out. Try again.');
+        timeout.type = 'timeout';
+        timeout.status = 0;
+        reject(timeout);
+      }, REQUEST_TIMEOUT_MS);
+      var opts = { credentials: 'include', headers: { 'Accept': 'application/json' } };
+      if (controller) opts.signal = controller.signal;
+      fetch(url, opts).then(function (res) {
+        return res.text().then(function (text) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ status: res.status, responseText: text });
         });
-        if (res.status === 200) return parseThread(parseJsonBody(res));
-        lastError = redditHttpError(res.status);
-        if (res.status === 404) break;
+      }, function () {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        var failed = new Error("Couldn't reach Reddit from the page.");
+        failed.type = 'network';
+        failed.status = 0;
+        reject(failed);
+      });
+    });
+  }
+
+  function blockedRedditResponse(res) {
+    if (!res) return true;
+    if (res.status === 401 || res.status === 403 || res.status === 429 || !res.status || res.status >= 500) return true;
+    if (res.status === 200 && !looksLikeJson(res.responseText)) return true;
+    return false;
+  }
+
+  // Page fetch sends the logged-in cookies. GM_xmlhttpRequest on Android often
+  // does not, and Reddit answers 403. Same URL via GM, then old.reddit.com.
+  async function fetchRedditJson(path, kind, meta) {
+    var origin = pageOrigin();
+    var same = origin + path;
+    var attempts = [
+      { via: 'page', url: same },
+      { via: 'gm', url: same },
+      { via: 'gm', url: 'https://old.reddit.com' + path }
+    ];
+    var seen = {};
+    var last = null;
+    for (var i = 0; i < attempts.length; i++) {
+      var attempt = attempts[i];
+      if (seen[attempt.via + attempt.url]) continue;
+      seen[attempt.via + attempt.url] = true;
+      try {
+        var res;
+        if (attempt.via === 'page') {
+          var pageUrl = new URL(attempt.url);
+          if (pageUrl.origin !== origin) continue;
+          res = await pageFetch(attempt.url);
+        } else {
+          res = await gmRequest({
+            method: 'GET',
+            url: attempt.url,
+            headers: { 'Accept': 'application/json' },
+            timeout: REQUEST_TIMEOUT_MS,
+            feed: kind !== 'thread'
+          });
+        }
+        if (res.status === 200 && looksLikeJson(res.responseText)) return parseJsonBody(res, kind, meta);
+        if (res.status === 404) {
+          last = redditHttpError(404, kind, meta);
+          break;
+        }
+        last = redditHttpError(res.status || 403, kind, meta);
+        if (!blockedRedditResponse(res)) break;
       } catch (err) {
-        lastError = err && err.type ? err : redditHttpError(0);
+        last = err && err.type ? err : redditHttpError(0, kind, meta);
+        if (last.status === 404) break;
       }
     }
-    throw lastError || redditHttpError(0);
+    throw last || redditHttpError(0, kind, meta);
   }
 
   async function fetchThread(href, feed) {
-    return fetchJsonListing(threadJsonUrls(href), feed);
+    var urls = threadJsonUrls(href);
+    if (!urls.length) throw redditHttpError(0, feed ? 'feed' : 'thread');
+    var json = await fetchRedditJson(pathFromRedditUrl(urls[0]), feed ? 'feed' : 'thread');
+    return parseThread(json);
   }
 
   // A crosspost with no discussion of its own still points at the original
@@ -1300,7 +1430,7 @@
     var urls = crosspostJsonUrls(thread.crosspost);
     if (!urls.length) return thread;
     try {
-      var parent = await fetchJsonListing(urls, feed);
+      var parent = parseThread(await fetchRedditJson(pathFromRedditUrl(urls[0]), 'thread'));
       var sub = parent.subreddit || thread.crosspost.subreddit || '';
       thread.commentsText = parent.commentsText;
       thread.commentCount = parent.commentCount;
@@ -2892,40 +3022,104 @@
     return text;
   }
 
-  async function fetchJsonRaw(urls, feed) {
-    var lastError = null;
-    for (var i = 0; i < urls.length; i++) {
-      try {
-        var res = await gmRequest({
-          method: 'GET',
-          url: urls[i],
-          headers: { 'Accept': 'application/json' },
-          timeout: REQUEST_TIMEOUT_MS,
-          feed: !!feed
-        });
-        if (res.status === 200) return parseJsonBody(res);
-        lastError = redditHttpError(res.status);
-        if (res.status === 404) break;
-      } catch (err) {
-        lastError = err && err.type ? err : redditHttpError(0);
-      }
-    }
-    throw lastError || redditHttpError(0);
+  function flairFromCard(el) {
+    if (!el || !el.querySelector) return '';
+    var node = el.querySelector('.linkflairlabel, .post-flair, [slot="post-flair"], shreddit-post-flair');
+    return node ? oneLine(node.textContent || '', 40) : '';
   }
 
-  function listingUrls(info) {
-    var hosts = [];
+  function permalinkPath(href) {
+    if (!href) return '';
     try {
-      if (HOSTS[location.hostname]) hosts.push(location.hostname);
-    } catch (err) { /* ignore */ }
-    ['www.reddit.com', 'old.reddit.com'].forEach(function (host) {
-      if (hosts.indexOf(host) === -1) hosts.push(host);
+      var url = new URL(href, 'https://www.reddit.com');
+      return url.pathname;
+    } catch (err) {
+      return String(href);
+    }
+  }
+
+  function scoreFromCard(el) {
+    if (!el) return 0;
+    var attr = el.getAttribute && (el.getAttribute('score') || el.getAttribute('data-score'));
+    if (attr != null && attr !== '') {
+      var parsed = parseFloat(String(attr).replace(/,/g, ''));
+      if (isFinite(parsed)) return Math.round(parsed);
+    }
+    var node = el.querySelector && el.querySelector('.score.unvoted, .score');
+    if (!node) return 0;
+    var text = node.getAttribute && node.getAttribute('title') || node.textContent || '';
+    var match = String(text).replace(/,/g, '').match(/-?\d+/);
+    return match ? parseInt(match[0], 10) : 0;
+  }
+
+  function scrapeDigestPosts(doc) {
+    if (!doc || !doc.querySelectorAll) return [];
+    var nodes = doc.querySelectorAll('shreddit-post');
+    if (!nodes.length) nodes = doc.querySelectorAll('#siteTable .thing.link, .linklisting .thing.link, .thing.link');
+    var posts = [];
+    for (var i = 0; i < nodes.length && posts.length < DIGEST_POSTS; i++) {
+      var el = nodes[i];
+      if (isPromotedCard(el)) continue;
+      var title = el.getAttribute ? (el.getAttribute('post-title') || '') : '';
+      if (!title && el.querySelector) {
+        var titleLink = el.querySelector('a.title, a.search-title, [slot="title"]');
+        title = titleLink ? titleLink.textContent || '' : '';
+      }
+      var permalink = el.getAttribute ? (el.getAttribute('permalink') || el.getAttribute('content-href') || '') : '';
+      if (!permalink && el.querySelector) {
+        var link = el.querySelector('a.comments, a.title');
+        permalink = link ? (link.getAttribute('href') || '') : '';
+      }
+      if (!title && !permalink) continue;
+      posts.push({
+        id: cardPostId(el),
+        title: oneLine(title, 160) || '(untitled)',
+        selftext: '',
+        score: scoreFromCard(el),
+        comments: commentCountFromCard(el) || 0,
+        flair: flairFromCard(el),
+        permalink: permalinkPath(permalink)
+      });
+    }
+    return posts;
+  }
+
+  function listingPath(info) {
+    var path = '/r/' + encodeURIComponent(info.sub) + '/' + info.sort + '.json?raw_json=1&limit=' + DIGEST_POSTS;
+    if (info.t) path += '&t=' + encodeURIComponent(info.t);
+    return path;
+  }
+
+  async function fetchDigestPosts(info) {
+    var posts = [];
+    var fromDom = false;
+    try {
+      var payload = await fetchRedditJson(listingPath(info), 'digest', { sub: info.sub });
+      posts = parseSubredditListing(payload);
+    } catch (err) {
+      posts = scrapeDigestPosts(typeof document !== 'undefined' ? document : null);
+      fromDom = true;
+      if (!posts.length) {
+        var failed = new Error("Couldn't load r/" + info.sub + "'s post list" +
+          (err && err.status ? ' (HTTP ' + err.status + ')' : '') + '.');
+        failed.status = err && err.status;
+        failed.type = 'reddit';
+        throw failed;
+      }
+    }
+    if (fromDom) return posts;
+    var ranked = posts.filter(function (post) {
+      return post.comments >= 3 && post.permalink;
+    }).sort(function (a, b) { return b.comments - a.comments; }).slice(0, DIGEST_COMMENT_POSTS);
+    await mapPool(ranked, 2, async function (post) {
+      try {
+        var thread = await fetchThread('https://www.reddit.com' + post.permalink, true);
+        post.commentsText = String(thread.commentsText || '').split('\n').filter(function (line) {
+          return line && line.charAt(0) !== ' ';
+        }).slice(0, 2).map(function (line) { return oneLine(line, 160); }).join(' | ');
+      } catch (err) { /* a missing comment sample should not block the digest */ }
     });
-    return hosts.map(function (host) {
-      var path = '/r/' + encodeURIComponent(info.sub) + '/' + info.sort + '.json?raw_json=1&limit=' + DIGEST_POSTS;
-      if (info.t) path += '&t=' + encodeURIComponent(info.t);
-      return 'https://' + host + path;
-    });
+    return posts;
   }
 
   async function mapPool(items, limit, fn) {
@@ -2941,23 +3135,6 @@
     }
     for (var i = 0; i < limit && i < items.length; i++) workers.push(worker());
     await Promise.all(workers);
-  }
-
-  async function fetchDigestPosts(info) {
-    var payload = await fetchJsonRaw(listingUrls(info), true);
-    var posts = parseSubredditListing(payload);
-    var ranked = posts.filter(function (post) {
-      return post.comments >= 3 && post.permalink;
-    }).sort(function (a, b) { return b.comments - a.comments; }).slice(0, DIGEST_COMMENT_POSTS);
-    await mapPool(ranked, 2, async function (post) {
-      try {
-        var thread = await fetchThread('https://www.reddit.com' + post.permalink, true);
-        post.commentsText = String(thread.commentsText || '').split('\n').filter(function (line) {
-          return line && line.charAt(0) !== ' ';
-        }).slice(0, 2).map(function (line) { return oneLine(line, 160); }).join(' | ');
-      } catch (err) { /* a missing comment sample should not block the digest */ }
-    });
-    return posts;
   }
 
   function findDigestAnchor(doc) {
@@ -2988,12 +3165,19 @@
     box.setAttribute('role', 'region');
     box.setAttribute('aria-label', 'Subreddit digest');
     var top = document.createElement('div');
-    top.className = 'rts-top';
+    top.className = 'rts-head';
+    var text = document.createElement('div');
+    text.className = 'rts-head-text';
     var badge = document.createElement('span');
     badge.className = 'rts-badge';
     badge.textContent = 'Subreddit digest';
+    var title = document.createElement('h2');
+    title.className = 'rts-title';
     var note = document.createElement('span');
     note.className = 'rts-note';
+    text.appendChild(badge);
+    text.appendChild(title);
+    text.appendChild(note);
     var refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.className = 'rts-iconbtn rts-digest-refresh';
@@ -3003,12 +3187,9 @@
     collapse.type = 'button';
     collapse.className = 'rts-iconbtn rts-digest-collapse';
     collapse.textContent = '▾';
-    top.appendChild(badge);
-    top.appendChild(note);
+    top.appendChild(text);
     top.appendChild(refresh);
     top.appendChild(collapse);
-    var title = document.createElement('h2');
-    title.className = 'rts-title';
     var body = document.createElement('div');
     body.className = 'rts-body';
     var status = document.createElement('p');
@@ -3021,7 +3202,6 @@
     body.appendChild(summary);
     body.appendChild(error);
     box.appendChild(top);
-    box.appendChild(title);
     box.appendChild(body);
     function keep(event) {
       event.stopPropagation();
@@ -3361,6 +3541,9 @@
       isFeedSentinel: isFeedSentinel,
       isOldReddit: isOldReddit,
       infiniteScrollDisabled: infiniteScrollDisabled,
+      fetchRedditJson: fetchRedditJson,
+      redditHttpError: redditHttpError,
+      scrapeDigestPosts: scrapeDigestPosts,
       subredditFeed: subredditFeed,
       parseSubredditListing: parseSubredditListing,
       getFeedModel: getFeedModel,

@@ -128,7 +128,9 @@ The digest is one Gemini call, using the feed model (`gemini-3.5-flash-lite` unl
 
 `https://raw.githubusercontent.com/mongkokman91/reddit-thread-summary/main/reddit-thread-summary.user.js`
 
-Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.2`.
+Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.3`.
+
+Reddit's post list and thread JSON are requested from the page itself, with the browser session, because the extension request on Android was getting a 403 even while you were logged in. If that is blocked, the script tries the extension and then old Reddit. A digest can still be written from the posts already on the screen. A 403 says it could not load that subreddit's post list, and mentions NSFW or quarantine only when the post is actually marked that way. The digest heading, refresh button, and collapse caret stay on one line.
 
 If Gemini says `gemini-3.8-flash` is busy, the script retries that model once, then switches to `gemini-3.5-flash-lite` and says which model wrote the summary. A request that never answers is cut off after 30 seconds, so a stalled retry cannot sit on “Retrying…” forever. After a 503, later thread and feed summaries use Flash-Lite for about 10 minutes. If Flash-Lite also fails, the card shows the error and **Try again**. The overall wait is capped at about three minutes and always ends as a summary or an error.
 
