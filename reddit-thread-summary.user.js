@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.0.0
+// @version      1.1.0
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -72,9 +72,11 @@
   var KEY_FEED_ON = 'rts.feedOn';
   var KEY_FEED_MODEL = 'rts.feedModel';
   var KEY_FEED_INDEX = 'rts.feedIndex';
+  var KEY_NO_INFINITE = 'rts.noInfinite';
   var FEED_MIN_COMMENTS = 5;
   var FEED_JSON_CONCURRENCY = 2;
   var FEED_GEMINI_GAP_MS = 6000;
+  var FEED_DWELL_MS = 1000;
   var PROMPT_FLAG = 'rts-key-prompted';
   var MODEL_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,80}$/;
   var HOSTS = {
@@ -315,7 +317,21 @@
     '.rts-feed[data-theme="dark"] .rts-feed-error { color: #ff9b93; }',
     '.rts-feed code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; background: var(--rts-chip); padding: 0 3px; border-radius: 4px; }',
     '.rts-feed a { color: var(--rts-link); }',
-    '.rts-feed button:focus-visible { outline: 2px solid var(--rts-accent); outline-offset: 2px; }'
+    '.rts-feed button:focus-visible { outline: 2px solid var(--rts-accent); outline-offset: 2px; }',
+    'html.rts-no-infinite faceplate-partial[slot="load-after"],',
+    'html.rts-no-infinite .rts-feed-sentinel { display: none !important; }',
+    '.rts-load-more {',
+    '  display: block; box-sizing: border-box; width: calc(100% - 16px); max-width: 100%;',
+    '  margin: 12px 8px 24px; min-height: 44px; padding: 10px 16px;',
+    '  border: 1px solid #d7dee7; border-radius: 999px; background: #f7f9fc; color: #1a1a1b;',
+    '  font: inherit; font-size: 15px; font-weight: 700; cursor: pointer;',
+    '}',
+    '.rts-load-more:disabled { opacity: 0.7; cursor: default; }',
+    'html.theme-dark .rts-load-more, html.dark .rts-load-more, html[theme="dark"] .rts-load-more,',
+    'html[data-theme="dark"] .rts-load-more { background: #1a1d23; color: #e6e8ea; border-color: #343a42; }',
+    '@media (prefers-color-scheme: dark) {',
+    '  .rts-load-more { background: #1a1d23; color: #e6e8ea; border-color: #343a42; }',
+    '}'
   ].join('\n');
 
   var panelEl = null;
@@ -1776,6 +1792,7 @@
       refreshCurrent();
     });
     addMenu((feedEnabled() ? '✓ ' : '') + 'Feed recaps', toggleFeedRecaps);
+    addMenu((infiniteScrollDisabled() ? '✓ ' : '') + 'Disable infinite scroll', toggleInfiniteScroll);
     addMenu('Set feed model (' + getFeedModel() + ')', function () {
       if (!askForFeedModel()) return;
       registerMenus();
@@ -2019,6 +2036,25 @@
     body.appendChild(status);
   }
 
+  function cancelDwell(card) {
+    if (!card || !card.__rtsDwell) return;
+    clearTimeout(card.__rtsDwell);
+    card.__rtsDwell = 0;
+  }
+
+  function startDwell(card) {
+    if (!card || card.__rtsDwell) return;
+    if (card.setAttribute) card.setAttribute('data-rts-watching', '1');
+    card.__rtsDwell = setTimeout(function () {
+      card.__rtsDwell = 0;
+      if (feedObserver) {
+        try { feedObserver.unobserve(card); } catch (err) { /* already gone */ }
+      }
+      card.setAttribute('data-rts-watched', '1');
+      onCardVisible(card);
+    }, FEED_DWELL_MS);
+  }
+
   function clearFeedUi() {
     feedQueue = [];
     feedQueued = Object.create(null);
@@ -2029,8 +2065,12 @@
     if (typeof document === 'undefined') return;
     var boxes = document.querySelectorAll('.rts-feed');
     for (var i = 0; i < boxes.length; i++) boxes[i].remove();
-    var watched = document.querySelectorAll('[data-rts-watched]');
-    for (var j = 0; j < watched.length; j++) watched[j].removeAttribute('data-rts-watched');
+    var watched = document.querySelectorAll('[data-rts-watched], [data-rts-watching]');
+    for (var j = 0; j < watched.length; j++) {
+      cancelDwell(watched[j]);
+      watched[j].removeAttribute('data-rts-watched');
+      watched[j].removeAttribute('data-rts-watching');
+    }
   }
 
   function waitGeminiSlot() {
@@ -2183,11 +2223,13 @@
     if (feedObserver || typeof IntersectionObserver !== 'function') return feedObserver;
     feedObserver = new IntersectionObserver(function (entries) {
       entries.forEach(function (entry) {
-        if (!entry.isIntersecting || !feedObserver) return;
-        feedObserver.unobserve(entry.target);
-        onCardVisible(entry.target);
+        if (!feedObserver) return;
+        // Stay observed until the card has been on screen for a second.
+        // Scrolling past cancels the timer and does not queue a recap.
+        if (entry.isIntersecting) startDwell(entry.target);
+        else cancelDwell(entry.target);
       });
-    }, { root: null, rootMargin: '120px 0px', threshold: 0 });
+    }, { root: null, rootMargin: '0px', threshold: 0 });
     return feedObserver;
   }
 
@@ -2212,13 +2254,172 @@
       try { href = location.href; } catch (err) { href = ''; }
       if (threadIdFromUrl(href) === id) continue;
       if (observer) {
-        card.setAttribute('data-rts-watched', '1');
-        observer.observe(card);
+        if (card.getAttribute('data-rts-watching') !== '1') {
+          card.setAttribute('data-rts-watching', '1');
+          observer.observe(card);
+        }
       } else if (cardInView(card)) {
-        card.setAttribute('data-rts-watched', '1');
-        onCardVisible(card);
+        startDwell(card);
+      } else {
+        cancelDwell(card);
       }
     }
+  }
+
+  function isOldReddit() {
+    try {
+      return typeof location !== 'undefined' && location.hostname === 'old.reddit.com';
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function infiniteScrollDisabled() {
+    var value = gmGet(KEY_NO_INFINITE, true);
+    return value !== false && value !== 'false';
+  }
+
+  // New Reddit fetches the next page when faceplate-partial[slot="load-after"]
+  // scrolls into view. Old Reddit uses next/prev links, which we leave alone.
+  function isFeedSentinel(el) {
+    if (!el || !el.getAttribute || String(el.tagName || '').toUpperCase() !== 'FACEPLATE-PARTIAL') return false;
+    if (isOldReddit()) return false;
+    var src = el.getAttribute('src') || '';
+    if (/comment/i.test(src)) return false;
+    if (el.closest && el.closest('shreddit-comment-tree, shreddit-comment')) return false;
+    if ((el.getAttribute('slot') || '') === 'load-after') return true;
+    return /\/svc\/shreddit\/(?:community-more-posts|feeds)\//i.test(src);
+  }
+
+  function installSentinelGuard() {
+    if (typeof window === 'undefined' || window.__rtsIO || typeof window.IntersectionObserver !== 'function') return;
+    var Native = window.IntersectionObserver;
+    function Wrapped(callback, options) {
+      return new Native(function (entries, observer) {
+        if (!infiniteScrollDisabled() || isOldReddit()) {
+          callback(entries, observer);
+          return;
+        }
+        callback(entries.map(function (entry) {
+          if (!isFeedSentinel(entry.target)) return entry;
+          return {
+            isIntersecting: false,
+            intersectionRatio: 0,
+            target: entry.target,
+            time: entry.time,
+            boundingClientRect: entry.boundingClientRect,
+            intersectionRect: entry.intersectionRect,
+            rootBounds: entry.rootBounds
+          };
+        }), observer);
+      }, options);
+    }
+    Wrapped.prototype = Native.prototype;
+    window.IntersectionObserver = Wrapped;
+    window.__rtsIO = true;
+  }
+
+  function countFeedPosts() {
+    if (typeof document === 'undefined') return 0;
+    return document.querySelectorAll('shreddit-post').length;
+  }
+
+  function removeLoadMoreButtons() {
+    if (typeof document === 'undefined') return;
+    var buttons = document.querySelectorAll('.rts-load-more');
+    for (var i = 0; i < buttons.length; i++) buttons[i].remove();
+    var marked = document.querySelectorAll('.rts-feed-sentinel');
+    for (var j = 0; j < marked.length; j++) marked[j].classList.remove('rts-feed-sentinel');
+  }
+
+  function loadMorePosts(sentinel, button) {
+    if (!sentinel || !sentinel.isConnected) {
+      button.disabled = true;
+      button.textContent = 'No more posts';
+      return;
+    }
+    button.disabled = true;
+    button.textContent = 'Loading…';
+    var before = countFeedPosts();
+    try {
+      if (typeof sentinel.loadContent === 'function') sentinel.loadContent();
+      else sentinel.setAttribute('loading', 'eager');
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = 'Load more posts';
+      return;
+    }
+    var tries = 0;
+    var timer = setInterval(function () {
+      tries += 1;
+      var grew = countFeedPosts() > before;
+      var gone = !sentinel.isConnected;
+      if (!grew && !gone && tries < 40) return;
+      clearInterval(timer);
+      applyInfiniteScroll();
+      if (!button.isConnected) return;
+      var stillThere = document.querySelector('faceplate-partial[slot="load-after"], .rts-feed-sentinel');
+      if (!grew && !stillThere) {
+        button.disabled = true;
+        button.textContent = 'No more posts';
+        return;
+      }
+      button.disabled = false;
+      button.textContent = 'Load more posts';
+    }, 200);
+  }
+
+  function ensureLoadMoreButton(sentinel) {
+    var previous = sentinel.previousElementSibling;
+    if (previous && previous.classList && previous.classList.contains('rts-load-more')) return previous;
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'rts-load-more';
+    button.textContent = 'Load more posts';
+    button.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      loadMorePosts(sentinel, button);
+    });
+    if (sentinel.parentElement) sentinel.parentElement.insertBefore(button, sentinel);
+    return button;
+  }
+
+  function applyInfiniteScroll() {
+    if (typeof document === 'undefined' || !document.documentElement) return;
+    var root = document.documentElement;
+    if (isOldReddit() || !infiniteScrollDisabled()) {
+      root.classList.remove('rts-no-infinite');
+      removeLoadMoreButtons();
+      return;
+    }
+    root.classList.add('rts-no-infinite');
+    var partials = document.querySelectorAll('faceplate-partial');
+    var live = [];
+    for (var i = 0; i < partials.length; i++) {
+      if (!isFeedSentinel(partials[i])) continue;
+      partials[i].classList.add('rts-feed-sentinel');
+      if ((partials[i].getAttribute('loading') || '') === 'lazy') {
+        partials[i].setAttribute('loading', 'action');
+      }
+      live.push(partials[i]);
+      ensureLoadMoreButton(partials[i]);
+    }
+    var buttons = document.querySelectorAll('.rts-load-more');
+    for (var j = 0; j < buttons.length; j++) {
+      var next = buttons[j].nextElementSibling;
+      var attached = false;
+      for (var k = 0; k < live.length; k++) {
+        if (live[k] === next) attached = true;
+      }
+      if (!attached) buttons[j].remove();
+    }
+  }
+
+  function toggleInfiniteScroll() {
+    gmSet(KEY_NO_INFINITE, !infiniteScrollDisabled());
+    registerMenus();
+    applyInfiniteScroll();
   }
 
   function toggleFeedRecaps() {
@@ -2252,6 +2453,7 @@
       watchUrl = '';
       removePanel();
       scanFeed();
+      applyInfiniteScroll();
       return;
     }
     if (href !== watchUrl) {
@@ -2262,6 +2464,7 @@
     var anchor = findAnchor(document, postId, Date.now() - watchStart > 5000);
     if (!anchor) {
       scanFeed();
+      applyInfiniteScroll();
       return;
     }
     var panel = getPanel();
@@ -2273,6 +2476,7 @@
     }
     runSummary(postId, { force: false });
     scanFeed();
+    applyInfiniteScroll();
   }
 
   function queueSync() {
@@ -2376,6 +2580,10 @@
       writeFeedCache: writeFeedCache,
       FEED_MIN_COMMENTS: FEED_MIN_COMMENTS,
       FEED_GEMINI_GAP_MS: FEED_GEMINI_GAP_MS,
+      FEED_DWELL_MS: FEED_DWELL_MS,
+      isFeedSentinel: isFeedSentinel,
+      isOldReddit: isOldReddit,
+      infiniteScrollDisabled: infiniteScrollDisabled,
       getFeedModel: getFeedModel,
       feedEnabled: feedEnabled
     };
@@ -2384,5 +2592,6 @@
 
   if (typeof document === 'undefined') return;
   if (window.top && window.top !== window.self) return;
+  installSentinelGuard();
   boot();
 })();

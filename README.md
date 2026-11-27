@@ -83,6 +83,9 @@ Open the userscript menu from Lemur's extensions grid: Tampermonkey or Violentmo
 - **Use gemini-4-neon (paid)**
 - **Use gemini-4-carbon (paid)**
 - **Custom model id…** — paste any other model id. Type `default` to go back to `gemini-3.8-flash`.
+- **Feed recaps** — on by default. Turn it off to stop the boxes under feed cards.
+- **Set feed model** — defaults to `gemini-3.5-flash-lite`. Type `default` to reset.
+- **Disable infinite scroll** — on by default. New Reddit shows **Load more posts** instead of loading the next page on its own. Old Reddit is unchanged.
 - **Clear saved summaries** — forget the six-hour cache.
 - **Refresh this summary** — fetch the thread and write a new TL;DR.
 
@@ -101,7 +104,7 @@ A saved summary shows how old it is (`saved 2h ago`). Refresh replaces it.
 
 On home (For You and Following), r/popular, r/all, a subreddit listing, and search results, a short **AI recap** sits under each post card on new Reddit (including the phone layout) and old Reddit. It is 2–3 sentences about the comments plus one or two takeaway bullets, so you can skip opening the thread.
 
-Recaps are not written for the whole page at once. A card is summarized when it scrolls into view. Posts with fewer than about 5 comments are skipped. Requests are queued, two JSON fetches at a time, and Gemini calls stay at about 10 per minute. A rate limit waits and retries with backoff.
+Recaps are not written for the whole page at once. A card is summarized only after it has stayed on screen for about a second; scrolling past cancels that. Posts with fewer than about 5 comments are skipped. Requests are queued, two JSON fetches at a time, and Gemini calls stay at about 10 per minute. A rate limit waits and retries with backoff.
 
 Feed recaps use **`gemini-3.5-flash-lite`** (about 500 free requests a day), not `gemini-3.8-flash`, so scrolling does not spend the thread model's daily quota. Change that with **Set feed model**. **Feed recaps** in the menu turns them off; they start on.
 
@@ -109,13 +112,17 @@ Each box is labeled **AI recap**, follows the light or dark theme, and collapses
 
 A recap is saved per post for six hours. Opening that thread shows the saved recap in the TL;DR panel immediately, then replaces it with the full discussion summary. A full summary saved from a thread is reused as the feed recap, so that post is not sent to Gemini twice.
 
+## Infinite scroll
+
+**Disable infinite scroll** is on by default. On new Reddit (www, the phone layout, and the other shreddit hosts) the feed no longer loads the next page by itself. A **Load more posts** button at the bottom loads the next batch when you tap it. Old Reddit already has next and previous page links, and those are left as they are. Turn the menu item off to go back to Reddit's automatic loading.
+
 ## Updates
 
 `@updateURL` and `@downloadURL` point at the raw script on `main`:
 
 `https://raw.githubusercontent.com/mongkokman91/reddit-thread-summary/main/reddit-thread-summary.user.js`
 
-Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo starts at `1.0.0`.
+Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.0`.
 
 ## Privacy
 
