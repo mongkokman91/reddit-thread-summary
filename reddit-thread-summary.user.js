@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.1
+// @version      1.1.2
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -72,11 +72,17 @@
   var KEY_FEED_ON = 'rts.feedOn';
   var KEY_FEED_MODEL = 'rts.feedModel';
   var KEY_FEED_INDEX = 'rts.feedIndex';
+  var KEY_DIGEST_ON = 'rts.digestOn';
+  var KEY_DIGEST_COLLAPSED = 'rts.digestCollapsed';
+  var KEY_DIGEST_INDEX = 'rts.digestIndex';
   var KEY_NO_INFINITE = 'rts.noInfinite';
   var FEED_MIN_COMMENTS = 5;
   var MIN_DISCUSSION_COMMENTS = 2;
-  var SUMMARY_TIMEOUT_MS = 60000;
+  var SUMMARY_TIMEOUT_MS = 180000;
+  var REQUEST_TIMEOUT_MS = 30000;
   var OVERLOAD_RETRY_MS = 2000;
+  var OVERLOAD_COOLDOWN_MS = 10 * 60 * 1000;
+  var KEY_BUSY_UNTIL = 'rts.modelBusyUntil';
   var FEED_JSON_CONCURRENCY = 2;
   var FEED_GEMINI_GAP_MS = 6000;
   var FEED_DWELL_MS = 1000;
@@ -334,7 +340,47 @@
     'html[data-theme="dark"] .rts-load-more { background: #1a1d23; color: #e6e8ea; border-color: #343a42; }',
     '@media (prefers-color-scheme: dark) {',
     '  .rts-load-more { background: #1a1d23; color: #e6e8ea; border-color: #343a42; }',
-    '}'
+    '}',
+    '#rts-digest {',
+    '  --rts-bg: #f7f9fc; --rts-fg: #1a1a1b; --rts-muted: #5c6c74;',
+    '  --rts-border: #d7dee7; --rts-accent: #3d5afe; --rts-chip: #e7ecf7;',
+    '  --rts-link: #0b63ce; --rts-danger: #9d1c1c;',
+    '  display: block !important; clear: both; box-sizing: border-box;',
+    '  width: auto; max-width: 100%; min-width: 0; margin: 8px 8px 12px; padding: 10px 12px 12px;',
+    '  background: var(--rts-bg); color: var(--rts-fg);',
+    '  border: 1px solid var(--rts-border); border-left: 4px solid var(--rts-accent);',
+    '  border-radius: 12px; font-family: inherit; font-size: 15px; line-height: 1.45;',
+    '  overflow-wrap: anywhere; position: relative; z-index: 1;',
+    '}',
+    '#rts-digest[data-theme="dark"] {',
+    '  --rts-bg: #1a1d23; --rts-fg: #e6e8ea; --rts-muted: #9aa3ab;',
+    '  --rts-border: #343a42; --rts-accent: #9db0ff; --rts-chip: #262b33;',
+    '  --rts-link: #8ecbff; --rts-danger: #ff9b93;',
+    '}',
+    '#rts-digest * { box-sizing: border-box; }',
+    '#rts-digest .rts-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }',
+    '#rts-digest .rts-badge {',
+    '  display: inline-flex; align-items: center; height: 22px; padding: 0 8px;',
+    '  border-radius: 999px; background: var(--rts-chip); color: var(--rts-accent);',
+    '  font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;',
+    '}',
+    '#rts-digest .rts-note { flex: 1 1 120px; color: var(--rts-muted); font-size: 12px; }',
+    '#rts-digest .rts-iconbtn {',
+    '  appearance: none; border: 0; background: transparent; color: var(--rts-fg);',
+    '  width: 44px; height: 44px; margin: -6px 0; border-radius: 10px;',
+    '  font: inherit; font-size: 18px; cursor: pointer;',
+    '}',
+    '#rts-digest .rts-title { margin: 2px 0 10px; font-size: 17px !important; line-height: 1.35 !important; font-weight: 700 !important; cursor: pointer; }',
+    '#rts-digest[data-collapsed="true"] .rts-body { display: none !important; }',
+    '#rts-digest .rts-hidden { display: none !important; }',
+    '#rts-digest .rts-status { margin: 0 0 8px; color: var(--rts-muted); }',
+    '#rts-digest .rts-summary p { margin: 0 0 12px; font-size: 15px; }',
+    '#rts-digest .rts-summary h3 { margin: 14px 0 8px; font-size: 15px !important; font-weight: 700 !important; }',
+    '#rts-digest .rts-summary ul { margin: 0 0 12px; padding-left: 1.15em; }',
+    '#rts-digest .rts-summary li { margin: 0 0 8px; font-size: 15px; }',
+    '#rts-digest code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; background: var(--rts-chip); padding: 0 4px; border-radius: 4px; }',
+    '#rts-digest a { color: var(--rts-link); }',
+    '#rts-digest .rts-error { margin: 0 0 8px; color: var(--rts-danger); }'
   ].join('\n');
 
   var panelEl = null;
@@ -434,8 +480,12 @@
     storageList(KEY_FEED_INDEX).forEach(function (item) {
       if (item && item.key) gmDelete(item.key);
     });
+    storageList(KEY_DIGEST_INDEX).forEach(function (item) {
+      if (item && item.key) gmDelete(item.key);
+    });
     gmSet(KEY_INDEX, []);
     gmSet(KEY_FEED_INDEX, []);
+    gmSet(KEY_DIGEST_INDEX, []);
   }
 
   function feedEnabled() {
@@ -764,9 +814,9 @@
     return { thinkingLevel: 'minimal' };
   }
 
-  function geminiRequestBody(thread, model, useSystem, useThinking, systemText) {
+  function geminiRequestBody(thread, model, useSystem, useThinking, systemText, userOverride) {
     var system = systemText || SYSTEM_PROMPT;
-    var userText = buildPrompt(thread);
+    var userText = userOverride || buildPrompt(thread);
     if (!useSystem) userText = system + '\n\n----\n\n' + userText;
     var generationConfig = { maxOutputTokens: 8192 };
     if (useThinking) generationConfig.thinkingConfig = thinkingConfigFor(model);
@@ -1109,12 +1159,12 @@
     return 'saved ' + Math.round(hours / 24) + 'd ago';
   }
 
-  function abortLive() {
+  function abortLive(includeFeed) {
     var pending = liveRequests;
     var keep = [];
     liveRequests = [];
     pending.forEach(function (handle) {
-      if (handle && handle.feed) {
+      if (!includeFeed && handle && handle.feed) {
         keep.push(handle);
         return;
       }
@@ -1123,7 +1173,11 @@
     liveRequests = keep.concat(liveRequests);
   }
 
+  // Violentmonkey and Tampermonkey on Android often never call ontimeout or
+  // onerror when a Gemini POST stalls, and abort() does not reject it either.
+  // A deadline owned by this script settles the promise anyway.
   function gmRequest(details) {
+    var limit = details.timeout || REQUEST_TIMEOUT_MS;
     return new Promise(function (resolve, reject) {
       if (typeof GM_xmlhttpRequest !== 'function') {
         var missing = new Error('This script needs Tampermonkey or Violentmonkey.');
@@ -1131,46 +1185,51 @@
         reject(missing);
         return;
       }
-      var handle;
+      var settled = false;
+      var raw = null;
+      function finish(ok, value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (ok) resolve(value);
+        else reject(value);
+      }
+      function fail(type, message) {
+        var err = new Error(message);
+        err.type = type;
+        err.gemini = !!details.gemini;
+        if (details.gemini && (type === 'timeout' || type === 'network')) err.overloaded = true;
+        finish(false, err);
+      }
+      var timer = setTimeout(function () {
+        try { if (raw && raw.abort) raw.abort(); } catch (err) { /* ignore */ }
+        fail('timeout', 'The request timed out. Try again.');
+      }, limit);
       try {
-        handle = GM_xmlhttpRequest({
+        raw = GM_xmlhttpRequest({
           method: details.method,
           url: details.url,
           headers: details.headers,
           data: details.data,
-          timeout: details.timeout,
+          timeout: limit,
           anonymous: false,
-          onload: function (res) { resolve(res || {}); },
-          onerror: function () {
-            var err = new Error('Couldn\'t reach the network. Check your connection and try again.');
-            err.type = 'network';
-            reject(err);
-          },
-          ontimeout: function () {
-            var err = new Error('The request timed out. Try again.');
-            err.type = 'timeout';
-            reject(err);
-          },
-          onabort: function () {
-            var err = new Error('aborted');
-            err.type = 'abort';
-            reject(err);
-          }
+          onload: function (res) { finish(true, res || {}); },
+          onerror: function () { fail('network', 'Couldn\'t reach the network. Check your connection and try again.'); },
+          ontimeout: function () { fail('timeout', 'The request timed out. Try again.'); },
+          onabort: function () { fail('abort', 'aborted'); }
         });
       } catch (err) {
-        var failed = new Error('Couldn\'t start the request.');
-        failed.type = 'network';
-        reject(failed);
+        fail('network', 'Couldn\'t start the request.');
         return;
       }
-      if (handle && handle.abort) {
-        var wrapped = {
+      if (raw && raw.abort) {
+        liveRequests.push({
           feed: !!details.feed,
-          abort: function () { try { handle.abort(); } catch (err) { /* ignore */ } }
-        };
-        liveRequests.push(wrapped);
-      } else if (handle) {
-        liveRequests.push(handle);
+          abort: function () {
+            try { raw.abort(); } catch (err) { /* ignore */ }
+            fail('abort', 'aborted');
+          }
+        });
       }
     });
   }
@@ -1217,7 +1276,7 @@
           method: 'GET',
           url: urls[i],
           headers: { 'Accept': 'application/json' },
-          timeout: 20000,
+          timeout: REQUEST_TIMEOUT_MS,
           feed: !!feed
         });
         if (res.status === 200) return parseThread(parseJsonBody(res));
@@ -1256,7 +1315,7 @@
     return thread;
   }
 
-  async function generateWithModel(thread, key, model, systemText, feed) {
+  async function generateWithModel(thread, key, model, systemText, feed, userOverride) {
     var useThinking = true;
     var useSystem = true;
     for (var attempt = 0; attempt < 2; attempt++) {
@@ -1268,9 +1327,10 @@
           'Content-Type': 'application/json',
           'x-goog-api-key': key
         },
-        data: JSON.stringify(geminiRequestBody(thread, model, useSystem, useThinking, systemText)),
-        timeout: 45000,
-        feed: !!feed
+        data: JSON.stringify(geminiRequestBody(thread, model, useSystem, useThinking, systemText, userOverride)),
+          timeout: REQUEST_TIMEOUT_MS,
+          feed: !!feed,
+          gemini: true
       });
       if (res.status === 200) {
         var data;
@@ -1329,47 +1389,84 @@
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
-  // One attempt, and if Gemini is overloaded (500/503/UNAVAILABLE), one retry
-  // of the same model after a short wait. Quota errors are not retried here.
-  async function generateOnceOrRetryOverload(thread, key, model, systemText, feed, onStatus) {
+  function modelBusy() {
+    var until = Number(gmGet(KEY_BUSY_UNTIL, 0));
+    return isFinite(until) && until > Date.now();
+  }
+
+  function markModelBusy() {
+    gmSet(KEY_BUSY_UNTIL, Date.now() + OVERLOAD_COOLDOWN_MS);
+  }
+
+  function clearModelBusy() {
+    gmSet(KEY_BUSY_UNTIL, 0);
+  }
+
+  function isOverloadError(err) {
+    return !!(err && (err.overloaded || (err.gemini && (err.type === 'timeout' || err.type === 'network'))));
+  }
+
+  // Retry a busy model once. A timeout or a second failure is final for this
+  // model so the caller can switch to flash-lite without waiting on a hung socket.
+  async function generateOnceOrRetryOverload(thread, key, model, systemText, feed, onStatus, userOverride) {
     try {
-      return await generateWithModel(thread, key, model, systemText, feed);
+      return await generateWithModel(thread, key, model, systemText, feed, userOverride);
     } catch (err) {
-      if (!(err && err.overloaded)) throw err;
+      if (!isOverloadError(err)) throw err;
+      if (model === DEFAULT_MODEL) markModelBusy();
       if (onStatus) onStatus(model + ' is busy. Retrying…');
       await delay(OVERLOAD_RETRY_MS);
-      return await generateWithModel(thread, key, model, systemText, feed);
+      try {
+        return await generateWithModel(thread, key, model, systemText, feed, userOverride);
+      } catch (again) {
+        if (again) again.overloaded = true;
+        throw again || err;
+      }
     }
   }
 
   // Returns { text, model, fallbackFrom, fallbackReason }. fallbackFrom is set
   // when a different model wrote the summary. The saved model is not changed.
-  async function callGemini(thread, key, requested, onStatus, allowSessionFallback, systemText, feed) {
+  async function callGemini(thread, key, requested, onStatus, allowSessionFallback, systemText, feed, userOverride) {
     var model = requested;
     var skipped = '';
     var reason = '';
-    if (allowSessionFallback && requested === DEFAULT_MODEL && flash38Exhausted()) {
+    var skipBecauseBusy = requested === DEFAULT_MODEL && modelBusy();
+    var skipBecauseQuota = allowSessionFallback && requested === DEFAULT_MODEL && flash38Exhausted();
+    if (skipBecauseBusy || skipBecauseQuota) {
       model = FALLBACK_MODEL;
       skipped = requested;
-      reason = 'quota';
-      if (onStatus) onStatus('gemini-3.8-flash already hit its free-tier limit. Using gemini-3.5-flash-lite…');
+      reason = skipBecauseBusy ? 'overload' : 'quota';
+      if (onStatus) {
+        onStatus(skipBecauseBusy
+          ? 'gemini-3.8-flash was busy. Using gemini-3.5-flash-lite…'
+          : 'gemini-3.8-flash already hit its free-tier limit. Using gemini-3.5-flash-lite…');
+      }
     }
     try {
-      var text = await generateOnceOrRetryOverload(thread, key, model, systemText, feed, onStatus);
-      if (model === DEFAULT_MODEL) clearFlash38Exhausted();
+      var text = await generateOnceOrRetryOverload(thread, key, model, systemText, feed, onStatus, userOverride);
+      if (model === DEFAULT_MODEL) {
+        clearFlash38Exhausted();
+        clearModelBusy();
+      }
       return { text: text, model: model, fallbackFrom: skipped, fallbackReason: reason };
     } catch (err) {
-      var switchModel = err && (err.autoRetry || err.overloaded) && model !== FALLBACK_MODEL;
+      var switchModel = model !== FALLBACK_MODEL && (isOverloadError(err) || (err && err.autoRetry));
       if (!switchModel) throw err;
-      var why = err.overloaded ? 'overload' : 'quota';
+      var why = err && err.autoRetry && !isOverloadError(err) ? 'quota' : 'overload';
       if (why === 'quota') markFlash38Exhausted();
+      if (why === 'overload') markModelBusy();
       if (onStatus) {
         onStatus(why === 'overload'
-          ? model + ' is overloaded. Trying gemini-3.5-flash-lite…'
+          ? 'Retry failed. Trying gemini-3.5-flash-lite…'
           : 'gemini-3.8-flash is out of free requests. Trying gemini-3.5-flash-lite…');
       }
-      var retry = await generateOnceOrRetryOverload(thread, key, FALLBACK_MODEL, systemText, feed, onStatus);
-      return { text: retry, model: FALLBACK_MODEL, fallbackFrom: model, fallbackReason: why };
+      try {
+        var retry = await generateOnceOrRetryOverload(thread, key, FALLBACK_MODEL, systemText, feed, onStatus, userOverride);
+        return { text: retry, model: FALLBACK_MODEL, fallbackFrom: model, fallbackReason: why };
+      } catch (fallbackErr) {
+        throw fallbackErr || err;
+      }
     }
   }
 
@@ -1461,6 +1558,8 @@
     if (typeof document === 'undefined' || !document.querySelectorAll) return;
     var boxes = document.querySelectorAll('.rts-feed');
     for (var i = 0; i < boxes.length; i++) boxes[i].setAttribute('data-theme', theme);
+    var digest = document.getElementById('rts-digest');
+    if (digest) digest.setAttribute('data-theme', theme);
   }
 
   function syncGridColumn(panel, node) {
@@ -1803,21 +1902,26 @@
     }
 
     renderLoading(panel, 'Reading the thread…', undefined, hadPreview);
-    var timedOut = false;
+    var alive = true;
     var summaryTimer = setTimeout(function () {
-      timedOut = true;
-      abortLive();
-      if (my !== runToken) return;
+      if (!alive || my !== runToken) return;
+      alive = false;
+      abortLive(true);
+      if (!panel.isConnected || panel.dataset.postId !== postId) return;
+      if (panel.dataset.state === 'ready') return;
       renderProblem(panel, {
         type: 'timeout',
         message: 'The summary took too long. Try again.'
       });
     }, SUMMARY_TIMEOUT_MS);
+    function stillRunning() {
+      return alive && my === runToken && panel.dataset.state !== 'error' && panel.dataset.postId === postId;
+    }
     try {
       var thread = await fetchThread(location.href);
-      if (timedOut || my !== runToken) return;
+      if (!stillRunning()) return;
       thread = await useOriginalThread(thread, false);
-      if (timedOut || my !== runToken) return;
+      if (!stillRunning()) return;
       if (discussionIsThin(thread)) {
         var emptyRec = {
           markdown: emptyDiscussionText(thread),
@@ -1828,17 +1932,18 @@
           sourceNote: thread.sourceNote || ''
         };
         writeCache(postId, model, emptyRec);
+        if (!stillRunning()) return;
         renderReady(panel, emptyRec, false);
         return;
       }
       renderLoading(panel, 'Writing the TL;DR…', thread.commentCount, hadPreview);
       if (thread.sourceNote) setNote(panel, 'Not a mod comment · ' + thread.sourceNote);
       var generated = await callGemini(thread, key, model, function (message) {
-        if (timedOut || my !== runToken) return;
+        if (!stillRunning()) return;
         renderLoading(panel, message, thread.commentCount, true);
         if (thread.sourceNote) setNote(panel, 'Not a mod comment · ' + thread.sourceNote);
       }, !opts.force);
-      if (timedOut || my !== runToken) return;
+      if (!stillRunning()) return;
       var raw = generated.text;
       var markdown = prepareSummary(raw, thread);
       if (!markdown) {
@@ -1866,12 +1971,20 @@
           sourceNote: thread.sourceNote || ''
         });
       }
-      if (timedOut || my !== runToken) return;
+      if (!stillRunning()) return;
       renderReady(panel, rec, false);
     } catch (err) {
-      if (timedOut || my !== runToken || (err && err.type === 'abort')) return;
+      if (!alive || my !== runToken || panel.dataset.state === 'error') return;
+      if (err && err.type === 'abort') {
+        renderProblem(panel, {
+          type: 'timeout',
+          message: 'The summary took too long. Try again.'
+        });
+        return;
+      }
       renderProblem(panel, err);
     } finally {
+      alive = false;
       clearTimeout(summaryTimer);
     }
   }
@@ -1936,6 +2049,7 @@
       refreshCurrent();
     });
     addMenu((feedEnabled() ? '✓ ' : '') + 'Feed recaps', toggleFeedRecaps);
+    addMenu((digestEnabled() ? '✓ ' : '') + 'Subreddit digest', toggleDigest);
     addMenu((infiniteScrollDisabled() ? '✓ ' : '') + 'Disable infinite scroll', toggleInfiniteScroll);
     addMenu('Set feed model (' + getFeedModel() + ')', function () {
       if (!askForFeedModel()) return;
@@ -2662,8 +2776,447 @@
     return true;
   }
 
+  var DIGEST_POSTS = 25;
+  var DIGEST_COMMENT_POSTS = 6;
+  var DIGEST_SORTS = { hot: true, new: true, top: true, rising: true, controversial: true, best: true };
+  var DIGEST_WINDOWS = { hour: true, day: true, week: true, month: true, year: true, all: true };
+  var AGGREGATE_SUBS = { popular: true, all: true, friends: true, mod: true, random: true, randnsfw: true };
+  var DIGEST_PROMPT = [
+    'You write a digest of a single subreddit feed for someone who has not opened the posts.',
+    'Return markdown only. No code fence. No preamble.',
+    '1. One paragraph of 2 or 3 sentences: what this subreddit is talking about in this listing. Bold the key topics.',
+    '2. Then 3 to 5 bullets. Each starts with **Theme name:** and names the relevant posts as markdown links using the exact URLs given below. Group posts that belong together. Do not invent posts or links.',
+    '3. Then a heading line exactly **Actionable takeaways** and 1 to 4 bullets. Always include this section. On a light or joke listing, a takeaway can be the vibe or the post most worth opening. Do not pad.',
+    'Never invent titles, scores, comment counts, or usernames. Casual and readable. Humor is fine. Never insult anyone.'
+  ].join('\n');
+  var digestToken = 0;
+
+  function digestEnabled() {
+    var value = gmGet(KEY_DIGEST_ON, true);
+    return value !== false && value !== 'false';
+  }
+
+  function subredditFeed(href) {
+    try {
+      var url = new URL(href);
+      if (!HOSTS[url.hostname]) return null;
+      if (/\/comments\//i.test(url.pathname)) return null;
+      var match = url.pathname.match(/^\/r\/([^/]+)(?:\/(hot|new|top|rising|controversial|best))?\/?$/i);
+      if (!match) return null;
+      var sub = match[1];
+      if (sub.indexOf('+') !== -1) return null;
+      if (AGGREGATE_SUBS[sub.toLowerCase()]) return null;
+      var sort = (match[2] || url.searchParams.get('sort') || 'hot').toLowerCase();
+      if (!DIGEST_SORTS[sort]) sort = 'hot';
+      var windowName = '';
+      if (sort === 'top' || sort === 'controversial') {
+        windowName = (url.searchParams.get('t') || 'day').toLowerCase();
+        if (!DIGEST_WINDOWS[windowName]) windowName = 'day';
+      }
+      return { sub: sub, sort: sort, t: windowName };
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function digestCacheKey(info) {
+    return 'rts.digest.' + info.sub.toLowerCase() + '.' + info.sort + '.' + (info.t || '-');
+  }
+
+  function readDigestCache(key) {
+    var rec = readStored(key);
+    if (!rec || !rec.markdown || !rec.cachedAt) return null;
+    if (Date.now() - rec.cachedAt > CACHE_TTL_MS) {
+      gmDelete(key);
+      return null;
+    }
+    return rec;
+  }
+
+  function writeDigestCache(key, rec) {
+    gmSet(key, rec);
+    var list = storageList(KEY_DIGEST_INDEX).filter(function (item) {
+      return item && item.key !== key;
+    });
+    list.push({ key: key, at: rec.cachedAt });
+    var now = Date.now();
+    var fresh = list.filter(function (item) {
+      return item && now - item.at <= CACHE_TTL_MS;
+    });
+    fresh.sort(function (a, b) { return b.at - a.at; });
+    var kept = fresh.slice(0, CACHE_MAX);
+    fresh.slice(CACHE_MAX).concat(list.filter(function (item) {
+      return item && now - item.at > CACHE_TTL_MS;
+    })).forEach(function (item) {
+      if (item && item.key !== key) gmDelete(item.key);
+    });
+    gmSet(KEY_DIGEST_INDEX, kept);
+  }
+
+  function parseSubredditListing(payload) {
+    var children = payload && payload.data && payload.data.children ? payload.data.children : [];
+    var posts = [];
+    children.forEach(function (child) {
+      if (!child || child.kind !== 't3' || !child.data || child.data.promoted) return;
+      var data = child.data;
+      posts.push({
+        id: String(data.id || '').replace(/^t3_/i, '').toLowerCase(),
+        title: oneLine(data.title || '', 160),
+        selftext: oneLine(data.selftext || '', 220),
+        score: data.score || 0,
+        comments: data.num_comments || 0,
+        flair: data.link_flair_text ? oneLine(data.link_flair_text, 40) : '',
+        permalink: data.permalink || ''
+      });
+    });
+    return posts.slice(0, DIGEST_POSTS);
+  }
+
+  function digestSource(info, posts) {
+    var lines = [
+      'Subreddit: r/' + info.sub,
+      'Sort: ' + info.sort + (info.t ? ' (' + info.t + ')' : ''),
+      ''
+    ];
+    posts.forEach(function (post, index) {
+      var url = post.permalink ? 'https://www.reddit.com' + post.permalink : '';
+      lines.push((index + 1) + '. ' + post.title);
+      if (url) lines.push('url: ' + url);
+      lines.push('score ' + post.score + ', ' + post.comments + ' comments' + (post.flair ? ', flair ' + post.flair : ''));
+      if (post.selftext) lines.push('body: ' + post.selftext);
+      if (post.commentsText) lines.push('top comments: ' + post.commentsText);
+      lines.push('');
+    });
+    var text = lines.join('\n');
+    if (text.length > 14000) text = text.slice(0, 13999) + '…';
+    return text;
+  }
+
+  async function fetchJsonRaw(urls, feed) {
+    var lastError = null;
+    for (var i = 0; i < urls.length; i++) {
+      try {
+        var res = await gmRequest({
+          method: 'GET',
+          url: urls[i],
+          headers: { 'Accept': 'application/json' },
+          timeout: REQUEST_TIMEOUT_MS,
+          feed: !!feed
+        });
+        if (res.status === 200) return parseJsonBody(res);
+        lastError = redditHttpError(res.status);
+        if (res.status === 404) break;
+      } catch (err) {
+        lastError = err && err.type ? err : redditHttpError(0);
+      }
+    }
+    throw lastError || redditHttpError(0);
+  }
+
+  function listingUrls(info) {
+    var hosts = [];
+    try {
+      if (HOSTS[location.hostname]) hosts.push(location.hostname);
+    } catch (err) { /* ignore */ }
+    ['www.reddit.com', 'old.reddit.com'].forEach(function (host) {
+      if (hosts.indexOf(host) === -1) hosts.push(host);
+    });
+    return hosts.map(function (host) {
+      var path = '/r/' + encodeURIComponent(info.sub) + '/' + info.sort + '.json?raw_json=1&limit=' + DIGEST_POSTS;
+      if (info.t) path += '&t=' + encodeURIComponent(info.t);
+      return 'https://' + host + path;
+    });
+  }
+
+  async function mapPool(items, limit, fn) {
+    var next = 0;
+    var workers = [];
+    function worker() {
+      if (next >= items.length) return Promise.resolve();
+      var index = next;
+      next += 1;
+      return Promise.resolve()
+        .then(function () { return fn(items[index]); })
+        .then(worker, worker);
+    }
+    for (var i = 0; i < limit && i < items.length; i++) workers.push(worker());
+    await Promise.all(workers);
+  }
+
+  async function fetchDigestPosts(info) {
+    var payload = await fetchJsonRaw(listingUrls(info), true);
+    var posts = parseSubredditListing(payload);
+    var ranked = posts.filter(function (post) {
+      return post.comments >= 3 && post.permalink;
+    }).sort(function (a, b) { return b.comments - a.comments; }).slice(0, DIGEST_COMMENT_POSTS);
+    await mapPool(ranked, 2, async function (post) {
+      try {
+        var thread = await fetchThread('https://www.reddit.com' + post.permalink, true);
+        post.commentsText = String(thread.commentsText || '').split('\n').filter(function (line) {
+          return line && line.charAt(0) !== ' ';
+        }).slice(0, 2).map(function (line) { return oneLine(line, 160); }).join(' | ');
+      } catch (err) { /* a missing comment sample should not block the digest */ }
+    });
+    return posts;
+  }
+
+  function findDigestAnchor(doc) {
+    var feed = doc.querySelector('shreddit-feed');
+    if (feed && feed.parentElement) return { position: 'before', node: feed };
+    var header = doc.querySelector('shreddit-subreddit-header');
+    if (header && header.parentElement) return { position: 'after', node: header };
+    var site = doc.querySelector('#siteTable');
+    if (site && site.parentElement) return { position: 'before', node: site };
+    return null;
+  }
+
+  function placeDigestBox(box, anchor) {
+    if (!box || !anchor || !anchor.node || !anchor.node.parentElement) return;
+    if (anchor.position === 'before') {
+      if (box.nextElementSibling === anchor.node) return;
+      anchor.node.parentElement.insertBefore(box, anchor.node);
+    } else {
+      if (anchor.node.nextElementSibling === box) return;
+      anchor.node.parentElement.insertBefore(box, anchor.node.nextSibling);
+    }
+    syncGridColumn(box, anchor.node);
+  }
+
+  function buildDigestBox() {
+    var box = document.createElement('section');
+    box.id = 'rts-digest';
+    box.setAttribute('role', 'region');
+    box.setAttribute('aria-label', 'Subreddit digest');
+    var top = document.createElement('div');
+    top.className = 'rts-top';
+    var badge = document.createElement('span');
+    badge.className = 'rts-badge';
+    badge.textContent = 'Subreddit digest';
+    var note = document.createElement('span');
+    note.className = 'rts-note';
+    var refresh = document.createElement('button');
+    refresh.type = 'button';
+    refresh.className = 'rts-iconbtn rts-digest-refresh';
+    refresh.setAttribute('aria-label', 'Refresh digest');
+    refresh.textContent = '↻';
+    var collapse = document.createElement('button');
+    collapse.type = 'button';
+    collapse.className = 'rts-iconbtn rts-digest-collapse';
+    collapse.textContent = '▾';
+    top.appendChild(badge);
+    top.appendChild(note);
+    top.appendChild(refresh);
+    top.appendChild(collapse);
+    var title = document.createElement('h2');
+    title.className = 'rts-title';
+    var body = document.createElement('div');
+    body.className = 'rts-body';
+    var status = document.createElement('p');
+    status.className = 'rts-status rts-hidden';
+    var summary = document.createElement('div');
+    summary.className = 'rts-summary';
+    var error = document.createElement('p');
+    error.className = 'rts-error rts-hidden';
+    body.appendChild(status);
+    body.appendChild(summary);
+    body.appendChild(error);
+    box.appendChild(top);
+    box.appendChild(title);
+    box.appendChild(body);
+    function keep(event) {
+      event.stopPropagation();
+      var outer = box.closest && box.closest('a');
+      if (!outer) return;
+      var inner = event.target && event.target.closest && event.target.closest('a');
+      if (inner && box.contains(inner)) return;
+      event.preventDefault();
+    }
+    ['click', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'touchstart', 'touchend'].forEach(function (type) {
+      box.addEventListener(type, keep, false);
+    });
+    function toggle() {
+      var next = box.getAttribute('data-collapsed') !== 'true';
+      gmSet(KEY_DIGEST_COLLAPSED, next);
+      applyDigestCollapsed(box, next);
+    }
+    collapse.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      toggle();
+    });
+    title.addEventListener('click', toggle);
+    refresh.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      var info = subredditFeed(location.href);
+      if (info) runDigest(info, box, true);
+    });
+    applyDigestCollapsed(box, gmGet(KEY_DIGEST_COLLAPSED, false) === true);
+    return box;
+  }
+
+  function applyDigestCollapsed(box, collapsed) {
+    box.setAttribute('data-collapsed', collapsed ? 'true' : 'false');
+    var button = box.querySelector('.rts-digest-collapse');
+    if (!button) return;
+    button.textContent = collapsed ? '▸' : '▾';
+    button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    button.setAttribute('aria-label', collapsed ? 'Expand digest' : 'Collapse digest');
+  }
+
+  function digestSortLabel(info) {
+    return info.sort + (info.t ? ' · ' + info.t : '');
+  }
+
+  function showDigestStatus(box, message) {
+    var status = box.querySelector('.rts-status');
+    var summary = box.querySelector('.rts-summary');
+    var error = box.querySelector('.rts-error');
+    if (status) {
+      status.textContent = message;
+      status.classList.remove('rts-hidden');
+    }
+    if (error) {
+      error.textContent = '';
+      error.classList.add('rts-hidden');
+    }
+    if (summary) summary.innerHTML = '';
+    box.dataset.state = 'loading';
+  }
+
+  function showDigest(box, rec) {
+    var status = box.querySelector('.rts-status');
+    var summary = box.querySelector('.rts-summary');
+    var error = box.querySelector('.rts-error');
+    var note = box.querySelector('.rts-note');
+    if (status) status.classList.add('rts-hidden');
+    if (error) error.classList.add('rts-hidden');
+    if (summary) summary.innerHTML = renderMarkdown(rec.markdown || '');
+    if (note) {
+      var bits = [digestSortLabel({ sort: rec.sort || '', t: rec.t || '' })];
+      if (rec.model) bits.push(rec.model);
+      if (rec.fallbackFrom) bits.push(rec.fallbackReason === 'overload' ? rec.fallbackFrom + ' was busy' : rec.fallbackFrom + ' hit its daily limit');
+      if (rec.cachedAt) bits.push(ageLabel(rec.cachedAt));
+      note.textContent = bits.filter(Boolean).join(' · ');
+    }
+    box.dataset.state = 'ready';
+  }
+
+  function showDigestError(box, message) {
+    var status = box.querySelector('.rts-status');
+    var error = box.querySelector('.rts-error');
+    if (status) status.classList.add('rts-hidden');
+    if (error) {
+      error.textContent = message;
+      error.classList.remove('rts-hidden');
+    }
+    box.dataset.state = 'error';
+  }
+
+  async function runDigest(info, box, force) {
+    var my = ++digestToken;
+    var keyName = digestCacheKey(info);
+    box.dataset.key = keyName;
+    var title = box.querySelector('.rts-title');
+    if (title) title.textContent = 'What r/' + info.sub + ' is talking about';
+    if (!force) {
+      var cached = readDigestCache(keyName);
+      if (cached && my === digestToken) {
+        cached.sort = info.sort;
+        cached.t = info.t;
+        showDigest(box, cached);
+        return;
+      }
+    }
+    showDigestStatus(box, 'Reading r/' + info.sub + '…');
+    var alive = true;
+    var timer = setTimeout(function () {
+      if (!alive || box.dataset.key !== keyName) return;
+      alive = false;
+      showDigestError(box, 'The digest took too long. Try again.');
+    }, SUMMARY_TIMEOUT_MS);
+    try {
+      var key = getKey();
+      if (!key) {
+        maybeAskForKey();
+        key = getKey();
+      }
+      if (!key) {
+        showDigestError(box, 'A Gemini API key is needed for the digest.');
+        return;
+      }
+      var posts = await fetchDigestPosts(info);
+      if (!alive || my !== digestToken) return;
+      if (!posts.length) {
+        showDigestError(box, 'This listing has no posts to digest.');
+        return;
+      }
+      showDigestStatus(box, 'Writing the digest…');
+      var generated = await callGemini({
+        title: info.sub,
+        author: '',
+        subreddit: info.sub,
+        score: 0,
+        commentCount: 20,
+        postType: 'text',
+        selftext: '',
+        commentsText: '',
+        authors: [],
+        sourceNote: ''
+      }, key, getFeedModel(), function (message) {
+        if (alive && my === digestToken) showDigestStatus(box, message);
+      }, false, DIGEST_PROMPT, true, digestSource(info, posts));
+      if (!alive || my !== digestToken) return;
+      var markdown = stripModelChrome(generated.text || '');
+      if (!markdown) throw new Error('Gemini returned an empty digest.');
+      var rec = {
+        markdown: markdown,
+        cachedAt: Date.now(),
+        model: generated.model,
+        fallbackFrom: generated.fallbackFrom || '',
+        fallbackReason: generated.fallbackReason || '',
+        sort: info.sort,
+        t: info.t || ''
+      };
+      writeDigestCache(keyName, rec);
+      if (!alive || my !== digestToken) return;
+      showDigest(box, rec);
+    } catch (err) {
+      if (!alive || my !== digestToken) return;
+      showDigestError(box, (err && err.message) ? err.message : 'Couldn\'t write the digest.');
+    } finally {
+      alive = false;
+      clearTimeout(timer);
+    }
+  }
+
+  function syncDigest(force) {
+    if (typeof document === 'undefined') return;
+    var info = digestEnabled() ? subredditFeed(location.href) : null;
+    var existing = document.getElementById('rts-digest');
+    if (!info) {
+      if (existing) existing.remove();
+      return;
+    }
+    var anchor = findDigestAnchor(document);
+    if (!anchor) return;
+    var box = existing || buildDigestBox();
+    placeDigestBox(box, anchor);
+    applyTheme(box);
+    var key = digestCacheKey(info);
+    if (!force && box.dataset.key === key && box.dataset.state) return;
+    runDigest(info, box, !!force);
+  }
+
+  function toggleDigest() {
+    gmSet(KEY_DIGEST_ON, !digestEnabled());
+    registerMenus();
+    syncDigest(false);
+  }
+
   function sync() {
     var href = location.href;
+    try { syncDigest(false); } catch (err) { /* keep the feed usable */ }
     if (!isThreadUrl(href)) {
       watchUrl = '';
       removePanel();
@@ -2798,12 +3351,18 @@
       FEED_DWELL_MS: FEED_DWELL_MS,
       SUMMARY_TIMEOUT_MS: SUMMARY_TIMEOUT_MS,
       OVERLOAD_RETRY_MS: OVERLOAD_RETRY_MS,
+      REQUEST_TIMEOUT_MS: REQUEST_TIMEOUT_MS,
+      gmRequest: gmRequest,
+      modelBusy: modelBusy,
+      markModelBusy: markModelBusy,
       discussionIsThin: discussionIsThin,
       emptyDiscussionText: emptyDiscussionText,
       crosspostJsonUrls: crosspostJsonUrls,
       isFeedSentinel: isFeedSentinel,
       isOldReddit: isOldReddit,
       infiniteScrollDisabled: infiniteScrollDisabled,
+      subredditFeed: subredditFeed,
+      parseSubredditListing: parseSubredditListing,
       getFeedModel: getFeedModel,
       feedEnabled: feedEnabled
     };

@@ -85,7 +85,7 @@ Open the userscript menu from Lemur's extensions grid: Tampermonkey or Violentmo
 - **Custom model id…** — paste any other model id. Type `default` to go back to `gemini-3.8-flash`.
 - **Feed recaps** — on by default. Turn it off to stop the boxes under feed cards.
 - **Set feed model** — defaults to `gemini-3.5-flash-lite`. Type `default` to reset.
-- **Disable infinite scroll** — on by default. New Reddit shows **Load more posts** instead of loading the next page on its own. Old Reddit is unchanged.
+- **Subreddit digest** — on by default. A digest at the top of a single subreddit’s feed. It stays off home, r/popular, r/all, and multireddits.
 - **Clear saved summaries** — forget the six-hour cache.
 - **Refresh this summary** — fetch the thread and write a new TL;DR.
 
@@ -112,6 +112,12 @@ Each box is labeled **AI recap**, follows the light or dark theme, and collapses
 
 A recap is saved per post for six hours. Opening that thread shows the saved recap in the TL;DR panel immediately, then replaces it with the full discussion summary. A full summary saved from a thread is reused as the feed recap, so that post is not sent to Gemini twice.
 
+## Subreddit digest
+
+On a single subreddit’s feed, such as `https://www.reddit.com/r/GeminiAI/` or the same page on old Reddit, a **Subreddit digest** appears under the subreddit header and above the posts. It follows the sort you are viewing (hot, new, top, and the top time window). It does not appear on home, r/popular, r/all, or a multireddit.
+
+The digest is one Gemini call, using the feed model (`gemini-3.5-flash-lite` unless you changed it), with the same retry and Flash-Lite fallback as other summaries. It reads about 25 posts (title, a snippet of the post, score, comment count, flair) and a couple of top comments from the most-discussed posts. You get a short “what r/X is talking about” paragraph, 3–5 themes that link the posts, and **Actionable takeaways**. It is cached per subreddit and sort for six hours. Tap the heading to collapse it; that choice is remembered. **↻** refreshes it. **Subreddit digest** in the menu turns it off. The per-post recaps underneath stay as they are.
+
 ## Infinite scroll
 
 **Disable infinite scroll** is on by default. On new Reddit (www, the phone layout, and the other shreddit hosts) the feed no longer loads the next page by itself. A **Load more posts** button at the bottom loads the next batch when you tap it. Old Reddit already has next and previous page links, and those are left as they are. Turn the menu item off to go back to Reddit's automatic loading.
@@ -122,9 +128,9 @@ A recap is saved per post for six hours. Opening that thread shows the saved rec
 
 `https://raw.githubusercontent.com/mongkokman91/reddit-thread-summary/main/reddit-thread-summary.user.js`
 
-Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.1`.
+Tampermonkey and Violentmonkey check that URL on their own schedule (Tampermonkey: the extension's settings, "Check for userscript updates"). **An update is installed only when `@version` in the file is higher than the installed version.** Editing the script on `main` without bumping `@version` does not roll out. The version in this repo is `1.1.2`.
 
-A crosspost is summarized from the original thread, labeled with that subreddit. If that discussion is empty too, the card says "No comments to summarize yet" instead of waiting on Gemini. A summary that runs longer than about a minute stops with **Try again**. If Gemini answers 503, 500, or that the model is overloaded, the script retries once and then uses `gemini-3.5-flash-lite`, and the card says which model wrote it.
+If Gemini says `gemini-3.8-flash` is busy, the script retries that model once, then switches to `gemini-3.5-flash-lite` and says which model wrote the summary. A request that never answers is cut off after 30 seconds, so a stalled retry cannot sit on “Retrying…” forever. After a 503, later thread and feed summaries use Flash-Lite for about 10 minutes. If Flash-Lite also fails, the card shows the error and **Try again**. The overall wait is capped at about three minutes and always ends as a summary or an error.
 
 ## Privacy
 
