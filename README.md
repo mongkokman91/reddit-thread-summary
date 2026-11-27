@@ -85,7 +85,7 @@ Open the userscript menu from Lemur's extensions grid: Tampermonkey or Violentmo
 - **Custom model id…** — paste any other model id. Type `default` to go back to `gemini-3.8-flash`.
 - **Feed recaps** — on by default. Turn it off to stop the boxes under feed cards.
 - **Set feed model** — defaults to `gemini-3.5-flash-lite`. Type `default` to reset.
-- **Disable infinite scroll** — on by default. New Reddit shows **Load more posts** instead of loading the next page on its own. Old Reddit is unchanged.
+- **Subreddit digest** — on by default. A digest at the top of a single subreddit’s feed. It stays off home, r/popular, r/all, and multireddits.
 - **Clear saved summaries** — forget the six-hour cache.
 - **Refresh this summary** — fetch the thread and write a new TL;DR.
 
@@ -111,6 +111,12 @@ Feed recaps use **`gemini-3.5-flash-lite`** (about 500 free requests a day), not
 Each box is labeled **AI recap**, follows the light or dark theme, and collapses when you tap the label. Taps on the box stay on the box and do not open the post.
 
 A recap is saved per post for six hours. Opening that thread shows the saved recap in the TL;DR panel immediately, then replaces it with the full discussion summary. A full summary saved from a thread is reused as the feed recap, so that post is not sent to Gemini twice.
+
+## Subreddit digest
+
+On a single subreddit’s feed, such as `https://www.reddit.com/r/GeminiAI/` or the same page on old Reddit, a **Subreddit digest** appears under the subreddit header and above the posts. It follows the sort you are viewing (hot, new, top, and the top time window). It does not appear on home, r/popular, r/all, or a multireddit.
+
+The digest is one Gemini call, using the feed model (`gemini-3.5-flash-lite` unless you changed it), with the same retry and Flash-Lite fallback as other summaries. It reads about 25 posts (title, a snippet of the post, score, comment count, flair) and a couple of top comments from the most-discussed posts. You get a short “what r/X is talking about” paragraph, 3–5 themes that link the posts, and **Actionable takeaways**. It is cached per subreddit and sort for six hours. Tap the heading to collapse it; that choice is remembered. **↻** refreshes it. **Subreddit digest** in the menu turns it off. The per-post recaps underneath stay as they are.
 
 ## Infinite scroll
 
