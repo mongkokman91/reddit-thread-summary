@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.8
+// @version      1.1.9
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -3089,7 +3089,7 @@
   }
 
   function digestCacheKey(info) {
-    if (info.kind === 'search') return 'rts.digest.search.' + encodeURIComponent(JSON.stringify([info.sub.toLowerCase(), info.query, info.sort, info.t, info.scope]));
+    if (info.kind === 'search') return 'rts.digest.search.v2.' + encodeURIComponent(JSON.stringify([info.sub.toLowerCase(), info.query, info.sort, info.t, info.scope]));
     var id = info.sub.toLowerCase();
     if (info.kind === 'user-multi') id = 'multi.' + info.user.toLowerCase() + '.' + info.name.toLowerCase();
     else if (info.kind === 'me-multi') id = 'multi.me.' + info.name.toLowerCase();
@@ -3267,14 +3267,58 @@
     return parseSubredditListing(payload);
   }
 
+  var SEARCH_WINDOW_MS = { hour: 3600000, day: 86400000, week: 604800000,
+    month: 2592000000, year: 31536000000 };
+
+  function searchPostTime(value) {
+    var raw = String(value || '').trim();
+    if (/^\d{10}(?:\.\d+)?$/.test(raw)) return Number(raw) * 1000;
+    if (/^\d{13}$/.test(raw)) return Number(raw);
+    if (!/^\d{4}-\d{2}-\d{2}(?:T|$)/i.test(raw)) return NaN;
+    return Date.parse(raw);
+  }
+
+  function searchRelativeUpperAge(value) {
+    var raw = String(value || '').trim();
+    if (/^just now$/i.test(raw)) return 60000;
+    var match = raw.match(/^(\d+)\s*(seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mos?|mo|years?|yrs?|y)\s*(?:ago)?$/i);
+    if (!match) return Infinity;
+    var unit = match[2].toLowerCase();
+    var size = /^mo/.test(unit) ? 31 * 86400000
+      : /^m/.test(unit) ? 60000 : /^s/.test(unit) ? 1000 : /^h/.test(unit) ? 3600000
+      : /^d/.test(unit) ? 86400000 : /^w/.test(unit) ? 604800000 : 366 * 86400000;
+    // A rounded label may be almost one whole unit older than displayed.
+    return (Number(match[1]) + 1) * size;
+  }
+
+  function searchCardInWindow(card, info, now) {
+    var range = SEARCH_WINDOW_MS[info.t];
+    if (!range) return true;
+    var stamp = card.querySelector('time[datetime], faceplate-timeago, time, [data-testid="post-timestamp"]');
+    function attr(el, name) { return el && el.getAttribute ? el.getAttribute(name) : ''; }
+    var raw = [attr(card, 'created-timestamp'), attr(card, 'data-created-utc'),
+      attr(stamp, 'datetime'), attr(stamp, 'ts'), attr(stamp, 'title')];
+    for (var i = 0; i < raw.length; i++) {
+      var time = searchPostTime(raw[i]);
+      if (isFinite(time)) return time <= now + 60000 && time >= now - range;
+    }
+    return stamp != null && searchRelativeUpperAge(stamp.textContent) <= range;
+  }
+
+  function searchDigestPosts(info, doc, href, now) {
+    return searchResultCards(doc, href).filter(function (card) {
+      return searchCardInWindow(card, info, now);
+    }).slice(0, DIGEST_POSTS).map(function (card) {
+      var row = card.__rtsSearchResult;
+      return { title: row.title, permalink: row.info.url, subreddit: row.info.sub };
+    });
+  }
+
   async function fetchDigestPosts(info) {
     if (info.kind === 'search') {
       // Use the results the user is actually seeing, not another listing or
       // an extra search request. This costs one digest call on the feed model.
-      return searchResultCards(document, location.href).slice(0, DIGEST_POSTS).map(function (card) {
-        var row = card.__rtsSearchResult;
-        return { title: row.title, permalink: row.info.url, subreddit: row.info.sub };
-      });
+      return searchDigestPosts(info, document, location.href, Date.now());
     }
     var posts = [];
     var fromDom = false;
@@ -3551,6 +3595,13 @@
       showDigestError(box, 'The digest took too long. Try again.');
     }, SUMMARY_TIMEOUT_MS);
     try {
+      var posts = info.kind === 'search' ? await fetchDigestPosts(info) : null;
+      if (!alive || my !== digestToken) return;
+      if (posts && !posts.length) {
+        showDigestStatus(box, 'Waiting for results with dates within this filter…');
+        box.dataset.state = 'waiting-for-dates';
+        return;
+      }
       var key = getKey();
       if (!key) {
         maybeAskForKey();
@@ -3560,7 +3611,7 @@
         showDigestError(box, 'A Gemini API key is needed for the digest.');
         return;
       }
-      var posts = await fetchDigestPosts(info);
+      if (!posts) posts = await fetchDigestPosts(info);
       if (!alive || my !== digestToken) return;
       if (!posts.length) {
         showDigestError(box, 'This listing has no posts to digest.');
@@ -3640,7 +3691,10 @@
     placeDigestBox(box, anchor);
     applyTheme(box);
     var key = digestCacheKey(info);
-    if (!force && box.dataset.key === key && box.dataset.state) return;
+    if (!force && box.dataset.key === key && box.dataset.state) {
+      if (box.dataset.state !== 'waiting-for-dates' ||
+          !searchDigestPosts(info, document, location.href, Date.now()).length) return;
+    }
     runDigest(info, box, !!force);
   }
 
