@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Thread Summary
 // @namespace    https://github.com/mongkokman91/reddit-thread-summary
-// @version      1.1.5
+// @version      1.1.6
 // @description  AI TL;DR at the top of a Reddit thread, plus a short AI recap under posts in feeds.
 // @author       mongkokman91
 // @license      MIT
@@ -87,7 +87,6 @@
   var FEED_JSON_CONCURRENCY = 2;
   var FEED_GEMINI_GAP_MS = 6000;
   var FEED_DWELL_MS = 1000;
-  var PROMPT_FLAG = 'rts-key-prompted';
   var MODEL_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,80}$/;
   var HOSTS = {
     'www.reddit.com': true,
@@ -1948,17 +1947,30 @@
   function askForKey() {
     var current = getKey();
     var entered = window.prompt(
-      'Paste your Gemini API key. Get a free key at aistudio.google.com/apikey. It stays in this userscript\'s storage on your device.',
       current
+        ? 'A Gemini API key is already saved. Enter a replacement, or leave blank to keep the saved key.'
+        : 'Paste your Gemini API key once. It stays in this browser profile. Get a key at aistudio.google.com/apikey.',
+      ''
     );
-    if (entered == null) return !!current;
+    if (entered == null) return false;
     var next = normalizeKey(entered);
-    if (!next) {
+    if (!next) return !!current;
+    try {
+      gmSet(KEY_API, next);
+      if (getKey() === next) return true;
+    } catch (err) { /* report the failure without exposing the key */ }
+    window.alert('Could not save the key. Check that your userscript manager allows script storage in this browser profile.');
+    return false;
+  }
+
+  function forgetKey() {
+    if (!getKey() || !window.confirm('Remove the saved Gemini API key from this browser profile?')) return false;
+    try {
       gmDelete(KEY_API);
-      return false;
-    }
-    gmSet(KEY_API, next);
-    return true;
+      if (!getKey()) return true;
+    } catch (err) { /* report the failure without exposing the key */ }
+    window.alert('Could not remove the saved key. Check your userscript manager settings.');
+    return false;
   }
 
   function askForModel() {
@@ -1977,16 +1989,6 @@
     if (next === current) return false;
     gmSet(KEY_MODEL, next);
     return true;
-  }
-
-  function maybeAskForKey() {
-    if (getKey()) return getKey();
-    var seen = false;
-    try { seen = sessionStorage.getItem(PROMPT_FLAG) === '1'; } catch (err) { seen = false; }
-    if (seen) return '';
-    try { sessionStorage.setItem(PROMPT_FLAG, '1'); } catch (err) { /* ignore */ }
-    askForKey();
-    return getKey();
   }
 
   async function runSummary(postId, opts) {
@@ -2023,12 +2025,11 @@
     }
 
     var key = getKey();
-    if (!key) key = maybeAskForKey();
     if (!key) {
       if (my !== runToken) return;
       renderProblem(panel, {
         type: 'missing-key',
-        message: 'A Gemini API key is needed. Get a free key at aistudio.google.com/apikey, then tap Set API key.'
+        message: 'Set your Gemini API key once for this browser profile.'
       });
       return;
     }
@@ -2169,7 +2170,14 @@
     menusLocked = true;
     var current = getModel();
     addMenu('Set Gemini API key', function () {
-      if (askForKey()) refreshCurrent();
+      if (!askForKey()) return;
+      refreshCurrent();
+      syncDigest(true);
+    });
+    addMenu('Forget Gemini API key', function () {
+      if (!forgetKey()) return;
+      refreshCurrent();
+      syncDigest(true);
     });
     MODEL_PRESETS.forEach(function (preset) {
       var mark = preset.id === current ? '✓ ' : '';
@@ -2416,7 +2424,7 @@
     body.innerHTML = renderMarkdown(rec.markdown || '');
   }
 
-  function showFeedError(box, message, onRetry) {
+  function showFeedError(box, message, onRetry, actionLabel) {
     if (!box || !box.querySelector) return;
     var body = box.querySelector('.rts-feed-body');
     if (!body) return;
@@ -2429,7 +2437,7 @@
     var button = document.createElement('button');
     button.type = 'button';
     button.className = 'rts-load-more';
-    button.textContent = 'Try again';
+    button.textContent = actionLabel || 'Try again';
     button.addEventListener('click', function (event) {
       event.preventDefault();
       event.stopPropagation();
@@ -2520,11 +2528,15 @@
       }
       var key = getKey();
       if (!key) {
-        maybeAskForKey();
-        key = getKey();
-      }
-      if (!key) {
-        showFeedError(item.box, 'A Gemini API key is needed for recaps.');
+        showFeedError(item.box, 'Set your Gemini API key once for this browser profile.', function () {
+          if (!getKey() && !askForKey()) return;
+          if (feedQueued[item.postId]) return;
+          item.attempts = 0;
+          item.quiet = false;
+          feedQueued[item.postId] = true;
+          feedQueue.push(item);
+          pumpFeed();
+        }, 'Set API key');
         delete feedQueued[item.postId];
         return;
       }
@@ -3402,13 +3414,22 @@
     box.dataset.state = 'ready';
   }
 
-  function showDigestError(box, message) {
+  function showDigestError(box, message, onSetup) {
     var status = box.querySelector('.rts-status');
     var error = box.querySelector('.rts-error');
     if (status) status.classList.add('rts-hidden');
     if (error) {
       error.textContent = message;
       error.classList.remove('rts-hidden');
+      if (onSetup) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'rts-load-more';
+        button.textContent = 'Set API key';
+        button.addEventListener('click', onSetup);
+        error.appendChild(document.createTextNode(' '));
+        error.appendChild(button);
+      }
     }
     box.dataset.state = 'error';
   }
@@ -3438,11 +3459,9 @@
     try {
       var key = getKey();
       if (!key) {
-        maybeAskForKey();
-        key = getKey();
-      }
-      if (!key) {
-        showDigestError(box, 'A Gemini API key is needed for the digest.');
+        showDigestError(box, 'Set your Gemini API key once for this browser profile.', function () {
+          if (getKey() || askForKey()) runDigest(info, box, true);
+        });
         return;
       }
       var posts = await fetchDigestPosts(info);
@@ -3619,6 +3638,9 @@
 
   if (typeof globalThis !== 'undefined' && globalThis.__RTS_TEST__) {
     globalThis.__RTS__ = {
+      getKey: getKey,
+      askForKey: askForKey,
+      forgetKey: forgetKey,
       DEFAULT_MODEL: DEFAULT_MODEL,
       FALLBACK_MODEL: FALLBACK_MODEL,
       MODEL_PRESETS: MODEL_PRESETS,

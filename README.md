@@ -44,7 +44,7 @@ Lemur is a Chromium browser and can install Chrome extensions.
    <https://raw.githubusercontent.com/mongkokman91/reddit-thread-summary/main/reddit-thread-summary.user.js>
 
 5. The extension will ask to install **Reddit Thread Summary**. Confirm it.
-6. Open any Reddit thread. The first time, paste a Gemini API key when asked.
+6. Open any Reddit thread, tap **Set API key** if shown, and paste your Gemini API key once.
 
 The same install works in desktop Chrome, Edge, and other Chromium browsers with Tampermonkey or Violentmonkey. The script runs on thread pages (`/r/<sub>/comments/<id>`) at `www.reddit.com`, `old.reddit.com`, `new.reddit.com`, `sh.reddit.com`, and `m.reddit.com`.
 
@@ -54,9 +54,9 @@ The summary is generated with your own key. The script does not ship with one.
 
 1. Open [Google AI Studio](https://aistudio.google.com/apikey) and sign in.
 2. Create an API key. Google's free tier is enough for reading threads.
-3. Paste it into the prompt the first time a thread loads, or use the menu command below.
+3. Click **Set API key** on a Reddit summary card, or **Set Gemini API key** in the userscript menu, and paste the key once. There are no automatic key pop-ups.
 
-The key is stored with `GM_setValue` in the userscript manager on your device. It is sent only to `generativelanguage.googleapis.com`, as the `x-goog-api-key` header.
+The userscript manager saves the key in its own storage. Threads, feed recaps, and digests reuse it after refreshes, browser restarts, and in-place script updates. No key is included in the source or sent to Reddit. Requests to `generativelanguage.googleapis.com` use it in the `x-goog-api-key` header. Another browser profile/device or an uninstall that clears script storage requires one-time setup there. Update the existing install instead of uninstalling it.
 
 `gemini-2.5-flash` is outdated and is not a preset. The default is **`gemini-3.8-flash`** (newest Flash, free tier, about 20 requests a day).
 
@@ -76,7 +76,8 @@ If `gemini-3.8-flash` comes back rate-limited (HTTP 429 or `RESOURCE_EXHAUSTED`)
 
 Open the userscript menu from Lemur's extensions grid: Tampermonkey or Violentmonkey, then **Reddit Thread Summary**. The model you are using has a check mark.
 
-- **Set Gemini API key** — replace or clear the key. Clearing the field and accepting deletes it.
+- **Set Gemini API key** — set or replace the key. Leaving the field blank keeps the existing key, which is never displayed in the prompt.
+- **Forget Gemini API key** — remove the key from this browser profile after confirmation.
 - **Use gemini-3.8-flash (free, ~20/day)** — the default.
 - **Use gemini-3.5-flash-lite (free, ~500/day)**
 - **Use gemini-4-hydrogen (free, ~20/day)**
